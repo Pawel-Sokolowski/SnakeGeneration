@@ -7,34 +7,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="14c16625-e3c4-4104-acca-575ff43641c3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/SnakeGeneration.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/codeStyles/codeStyleConfig.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Font/PoetsenOne-Regular.ttf" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/apple.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_bl.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_br.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_horizontal.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_tl.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_tr.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/body_vertical.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/head_down.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/head_left.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/head_right.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/head_up.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/tail_down.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/tail_left.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/tail_right.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Graphics/tail_up.png" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Sound/crunch.wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/copyright" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/snake.py" afterDir="false" />
-    </list>
+    <list default="true" id="14c16625-e3c4-4104-acca-575ff43641c3" name="Changes" comment="Create snake.cpython-310.pyc" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -58,7 +31,7 @@
 }]]></component>
   <component name="GithubPullRequestsUISettings"><![CDATA[{
   "selectedUrlAndAccountId": {
-    "url": "https://github.com/leap-ec/LEAP.git",
+    "url": "https://github.com/Pawel-Sokolowski/SnakeGeneration.git",
     "accountId": "ac4afb88-2782-41c6-8a74-61ffb81c4f27"
   }
 }]]></component>
@@ -121,6 +94,36 @@
       <option name="presentableId" value="Default" />
       <updated>1750598740796</updated>
     </task>
+    <task id="LOCAL-00001" summary="First commit">
+      <option name="closed" value="true" />
+      <created>1751127447103</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1751127447103</updated>
+    </task>
+    <task id="LOCAL-00002" summary="First commit">
+      <option name="closed" value="true" />
+      <created>1751127453653</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1751127453653</updated>
+    </task>
+    <task id="LOCAL-00003" summary="Create snake.cpython-310.pyc">
+      <option name="closed" value="true" />
+      <created>1751127547443</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1751127547443</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="First commit" />
+    <MESSAGE value="Create snake.cpython-310.pyc" />
+    <option name="LAST_COMMIT_MESSAGE" value="Create snake.cpython-310.pyc" />
   </component>
 </project>
