@@ -1,13 +1,14 @@
 import numpy as np
-import os
 import time
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["DML_VISIBLE_DEVICES"] = "-1"
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import gymnasium as gym
 import snake_gym_env  # your custom Snake gym environment
-from tqdm import trange
+from tqdm import trange, tqdm
 from collections import deque
 
 def create_dense_q_model(input_shape, num_actions):
@@ -15,6 +16,8 @@ def create_dense_q_model(input_shape, num_actions):
         layers.Input(shape=input_shape),
         layers.Dense(64, activation='relu'),
         layers.Dense(64, activation='relu'),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(16, activation='relu'),
         layers.Dense(num_actions, activation='linear')
     ])
 
@@ -33,14 +36,13 @@ def render_trained_agent(trained_model, env_class="Snake-v0", grid_size=20):
         total_reward += reward
         steps += 1
         eval_env.render()
-        time.sleep(0.05)  # Control rendering speed
+        time.sleep(0.05)
         done = terminated or truncated
 
     print(f"Final episode reward: {total_reward}, steps: {steps}")
     eval_env.close()
 
 def main():
-    NUM_ENVS = 2048
     n_episodes = 100_000
     max_steps_per_episode = 500
     gamma = 0.99
@@ -53,12 +55,9 @@ def main():
     update_after_actions = 4
     update_target_network = 1000
 
-    env = gym.vector.SyncVectorEnv([
-        lambda: gym.make("Snake-v0", render_mode=None)
-        for _ in range(NUM_ENVS)
-    ])
-    num_actions = env.single_action_space.n
-    input_shape = env.single_observation_space.shape
+    env = gym.make("Snake-v0", render_mode=None)
+    num_actions = env.action_space.n
+    input_shape = env.observation_space.shape
 
     model = create_dense_q_model(input_shape, num_actions)
     model_target = create_dense_q_model(input_shape, num_actions)
@@ -73,7 +72,6 @@ def main():
     done_history = deque(maxlen=max_memory_length)
     episode_reward_history = deque(maxlen=100)
     step_count = 0
-    episode_rewards = np.zeros(NUM_ENVS, dtype=np.float32)
 
     @tf.function
     def train_step(state_sample, action_sample, rewards_sample, state_next_sample, done_sample):
@@ -91,40 +89,35 @@ def main():
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         return loss
 
-    obs, _ = env.reset(seed=None)
-    obs = np.array(obs, dtype=np.float32)
     running_reward = 0
 
-    for episode_count in trange(n_episodes, desc="Training Episodes"):
-        episode_rewards[:] = 0
-        dones = np.zeros(NUM_ENVS, dtype=bool)
+    progress = trange(n_episodes, desc="Training Episodes", dynamic_ncols=True)
+    for episode_count in progress:
         obs, _ = env.reset(seed=None)
         obs = np.array(obs, dtype=np.float32)
+        episode_reward = 0
 
         for t in range(max_steps_per_episode):
-            step_count += NUM_ENVS
+            step_count += 1
 
-            rand_vals = np.random.rand(NUM_ENVS)
-            greedy_actions = np.argmax(
-                model(tf.convert_to_tensor(obs), training=False).numpy(), axis=1
-            )
-            random_actions = np.random.randint(num_actions, size=NUM_ENVS)
-            actions = np.where(rand_vals < epsilon, random_actions, greedy_actions)
+            if np.random.rand() < epsilon:
+                action = np.random.randint(num_actions)
+            else:
+                action = np.argmax(model(tf.convert_to_tensor(np.expand_dims(obs, axis=0)), training=False).numpy())
 
             epsilon -= epsilon_interval / 1_000_000
             epsilon = max(epsilon, epsilon_min)
 
-            next_obs, rewards, terminateds, truncateds, infos = env.step(actions)
+            next_obs, reward, terminated, truncated, info = env.step(action)
             next_obs = np.array(next_obs, dtype=np.float32)
-            dones = np.logical_or(terminateds, truncateds)
+            done = terminated or truncated
 
-            for i in range(NUM_ENVS):
-                action_history.append(actions[i])
-                state_history.append(obs[i])
-                state_next_history.append(next_obs[i])
-                rewards_history.append(rewards[i])
-                done_history.append(dones[i])
-                episode_rewards[i] += rewards[i]
+            action_history.append(action)
+            state_history.append(obs)
+            state_next_history.append(next_obs)
+            rewards_history.append(reward)
+            done_history.append(done)
+            episode_reward += reward
 
             obs = next_obs
 
@@ -140,23 +133,21 @@ def main():
             if step_count % update_target_network == 0:
                 model_target.set_weights(model.get_weights())
                 running_reward = np.mean(episode_reward_history) if episode_reward_history else 0.0
-                print(f"Running reward: {running_reward:.2f} at episode {episode_count}, step count {step_count}")
+                tqdm.write(f"Running reward: {running_reward:.2f} at episode {episode_count}, step count {step_count}")
 
-            for i in range(NUM_ENVS):
-                if dones[i]:
-                    episode_reward_history.append(episode_rewards[i])
-                    episode_rewards[i] = 0
+            if done:
+                break
 
+        episode_reward_history.append(episode_reward)
         running_reward = np.mean(episode_reward_history) if episode_reward_history else 0.0
 
         if running_reward > 40:
-            print(f"Solved at episode {episode_count+1}!")
+            tqdm.write(f"Solved at episode {episode_count+1}!")
             break
 
     env.close()
 
-    # --- Render the trained agent once after training ---
-    render_trained_agent(model, env_class="Snake-v0", grid_size=50)  # Change grid_size if needed
+    render_trained_agent(model, env_class="Snake-v0", grid_size=50)
 
 if __name__ == "__main__":
     main()
