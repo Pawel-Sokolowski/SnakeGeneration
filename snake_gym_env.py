@@ -4,11 +4,12 @@ import numpy as np
 import pygame
 from pygame.math import Vector2
 import random
+from gymnasium.envs.registration import register
 
 class SnakeEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 15}
 
-    def __init__(self, grid_size=20, render_mode="human"):
+    def __init__(self, grid_size=50, render_mode="human"):
         super().__init__()
         self.grid_size = grid_size
         self.cell_size = 40
@@ -65,6 +66,12 @@ class SnakeEnv(gym.Env):
     def step(self, action):
         if self.done:
             return self._get_obs(), 0, True, False, {}
+
+        head_pos = self.snake[0]
+        fruit_pos = self.fruit
+        # Compute Manhattan distance before move
+        prev_dist = abs(head_pos.x - fruit_pos.x) + abs(head_pos.y - fruit_pos.y)
+
         action_map = [Vector2(1, 0), Vector2(0, -1), Vector2(-1, 0), Vector2(0, 1)]
         new_direction = action_map[action]
         if not (new_direction + self.direction == Vector2(0, 0)):
@@ -78,9 +85,13 @@ class SnakeEnv(gym.Env):
         self.snake.insert(0, new_head)
         reward = -0.01  # Step penalty for wandering
 
+        new_dist = abs(new_head.x - fruit_pos.x) + abs(new_head.y - fruit_pos.y)
+        if new_dist < prev_dist:
+            reward += 0.3
+
         if new_head == self.fruit:
             self.score += 1
-            reward = 1  # Overwrite penalty with fruit reward
+            reward += 1
             if self.render_mode == "human" and self._pygame_initialized:
                 self.crunch_sound.play()
             self._randomize_fruit()
@@ -201,7 +212,6 @@ class SnakeEnv(gym.Env):
             pygame.quit()
             self._pygame_initialized = False
 
-from gymnasium.envs.registration import register
 register(
     id="Snake-v0",
     entry_point="snake_gym_env:SnakeEnv",
