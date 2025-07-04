@@ -11,14 +11,27 @@ from tqdm import trange, tqdm
 from collections import deque
 import matplotlib.pyplot as plt
 
-def create_dense_q_model(input_shape, num_actions):
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        tf.config.set_visible_devices(gpus[0], 'GPU')
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        print(f"Using GPU: {gpus[0].name}")
+    except RuntimeError as e:
+        print(e)
+else:
+    print("No GPU detected, running on CPU.")
+
+def create_conv1d_q_model(input_shape, num_actions):
     return keras.Sequential([
-        layers.Input(shape=input_shape),
-        layers.Dense(64, activation='sigmoid'),
-        layers.Dense(64, activation='sigmoid'),
-        layers.Dense(32, activation='sigmoid'),
-        layers.Dense(32, activation='sigmoid'),
-        layers.Dense(num_actions, activation='softmax')
+        layers.Input(shape=input_shape),  # (2501, 2)
+        layers.Conv1D(64, kernel_size=3, activation='relu', padding='same'),
+        layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
+        layers.Conv1D(64, kernel_size=3, activation='relu', padding='same'),
+        layers.GlobalMaxPooling1D(),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(num_actions, activation='linear')
     ])
 
 def param_grid_search(param_grid):
@@ -29,11 +42,11 @@ def param_grid_search(param_grid):
 def main():
     param_grid = {
         "n_episodes": [100_000],
-        "gamma": [0.95, 0.99],
+        "gamma": [0.90,0.95, 0.99],
         "epsilon": [1.0],
-        "epsilon_min": [0.1],
-        "batch_size": [128, 256, 512, 1024],
-        "learning_rate": [0.00025, 0.0005, 0.005, 0.01],
+        "epsilon_min": [0.05],
+        "batch_size": [64],
+        "learning_rate": [0.0001, 0.0015, 0.002],
     }
 
     for params in param_grid_search(param_grid):
@@ -54,8 +67,8 @@ def main():
         num_actions = env.action_space.n
         input_shape = env.observation_space.shape
 
-        model = create_dense_q_model(input_shape, num_actions)
-        model_target = create_dense_q_model(input_shape, num_actions)
+        model = create_conv1d_q_model(input_shape, num_actions)
+        model_target = create_conv1d_q_model(input_shape, num_actions)
         model_target.set_weights(model.get_weights())
         optimizer = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
         loss_function = keras.losses.Huber()
@@ -74,7 +87,7 @@ def main():
             future_rewards = model_target(state_next_sample, training=False)
             max_future_q = tf.reduce_max(future_rewards, axis=1)
             updated_q_values = rewards_sample + gamma * max_future_q
-            updated_q_values = updated_q_values * (1 - done_sample) - done_sample
+            updated_q_values = updated_q_values * (1.0 - done_sample) - done_sample
 
             masks = tf.one_hot(action_sample, num_actions)
             with tf.GradientTape() as tape:
@@ -99,7 +112,9 @@ def main():
                 if np.random.rand() < e:
                     action = np.random.randint(num_actions)
                 else:
-                    action = np.argmax(model(tf.convert_to_tensor(np.expand_dims(obs, axis=0)), training=False).numpy())
+                    action = np.argmax(
+                        model(tf.convert_to_tensor(np.expand_dims(obs, axis=0)), training=False).numpy()
+                    )
 
                 e -= epsilon_interval / 1_000_000
                 e = max(e, epsilon_min)
@@ -129,7 +144,7 @@ def main():
                 if step_count % update_target_network == 0:
                     model_target.set_weights(model.get_weights())
                     running_reward = np.mean(episode_reward_history) if episode_reward_history else 0.0
-                    tqdm.write(f"Running reward: {running_reward:.2f} at episode {episode_count}, step count {step_count}")
+                    tqdm.write(f"Running reward: {running_reward:.2f} at episode {episode_count}, step {step_count}")
 
                 if done:
                     break
@@ -146,8 +161,7 @@ def main():
         os.makedirs(model_dir, exist_ok=True)
         model_name = (
             f"model_ep{n_episodes}_gamma{str(gamma).replace('.','')}_"
-            f"epsilon{str(epsilon).replace('.','')}_"
-            f"lr{str(learning_rate).replace('.','')}.keras"
+            f"epsilon{str(epsilon).replace('.','')}_lr{str(learning_rate).replace('.','')}.keras"
         )
         model_path = os.path.join(model_dir, model_name)
         model.save(model_path)

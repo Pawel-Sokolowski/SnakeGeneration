@@ -15,10 +15,15 @@ class SnakeEnv(gym.Env):
         self.cell_size = 40
         self.window_size = self.grid_size * self.cell_size
         self.render_mode = render_mode
+
+        self.max_snake_length = self.grid_size * self.grid_size
+        obs_shape = (self.max_snake_length + 1, 2)
+
         self.action_space = spaces.Discrete(4)
-        obs_low = np.array([0, 0, 0, 0], dtype=np.int32)
-        obs_high = np.array([grid_size-1, grid_size-1, grid_size-1, grid_size-1], dtype=np.int32)
-        self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.int32)
+        self.observation_space = spaces.Box(
+            low=-1, high=self.grid_size-1, shape=obs_shape, dtype=np.int32
+        )
+
         self._pygame_initialized = False
         self.snake = None
         self.fruit = None
@@ -55,9 +60,8 @@ class SnakeEnv(gym.Env):
         super().reset(seed=seed)
         if self.render_mode == "human":
             self._init_pygame()
-        self.direction = Vector2(1, 0)  # Start moving right
+        self.direction = Vector2(1, 0)
         self.snake = [Vector2(5, 10), Vector2(4, 10), Vector2(3, 10)]
-        self.new_block = False
         self._randomize_fruit()
         self.done = False
         self.score = 0
@@ -116,14 +120,19 @@ class SnakeEnv(gym.Env):
                 break
 
     def _get_obs(self):
-        return np.array([int(self.snake[0].x), int(self.snake[0].y), int(self.fruit.x), int(self.fruit.y)], dtype=np.int32)
+        body_coords = [(int(block.x), int(block.y)) for block in self.snake]
+        padding_length = self.max_snake_length - len(body_coords)
+        padded_coords = body_coords + [(-1, -1)] * padding_length
+        fruit_coord = [(int(self.fruit.x), int(self.fruit.y))]
+        obs = np.array(padded_coords + fruit_coord, dtype=np.int32)
+        return obs
 
     def render(self):
         if self.render_mode != "human":
             return
         if not self._pygame_initialized:
             self._init_pygame()
-        self.screen.fill((175,215,70))
+        self.screen.fill((175, 215, 70))
         self._draw_grass()
         self._draw_snake()
         self._draw_fruit()
@@ -161,7 +170,7 @@ class SnakeEnv(gym.Env):
 
     def _update_head_graphics(self):
         if len(self.snake) < 2:
-            self.head = self.head_right  # default
+            self.head = self.head_right
             return
         head_relation = self.snake[1] - self.snake[0]
         if head_relation == Vector2(1,0): self.head = self.head_left
@@ -172,7 +181,7 @@ class SnakeEnv(gym.Env):
 
     def _update_tail_graphics(self):
         if len(self.snake) < 2:
-            self.tail = self.tail_right  # default
+            self.tail = self.tail_right
             return
         tail_relation = self.snake[-2] - self.snake[-1]
         if tail_relation == Vector2(1,0): self.tail = self.tail_left
@@ -186,25 +195,25 @@ class SnakeEnv(gym.Env):
         self.screen.blit(self.apple, fruit_rect)
 
     def _draw_grass(self):
-        grass_color = (167,209,61)
+        grass_color = (167, 209, 61)
         for row in range(self.grid_size):
             for col in range(self.grid_size):
-                if (row+col)%2==0:
-                    grass_rect = pygame.Rect(col*self.cell_size,row*self.cell_size,self.cell_size,self.cell_size)
-                    pygame.draw.rect(self.screen,grass_color,grass_rect)
+                if (row + col) % 2 == 0:
+                    grass_rect = pygame.Rect(col * self.cell_size, row * self.cell_size, self.cell_size, self.cell_size)
+                    pygame.draw.rect(self.screen, grass_color, grass_rect)
 
     def _draw_score(self):
         score_text = str(self.score)
-        score_surface = self.font.render(score_text,True,(56,74,12))
+        score_surface = self.font.render(score_text, True, (56,74,12))
         score_x = int(self.cell_size * self.grid_size - 60)
         score_y = int(self.cell_size * self.grid_size - 40)
-        score_rect = score_surface.get_rect(center=(score_x,score_y))
-        apple_rect = self.apple.get_rect(midright=(score_rect.left,score_rect.centery))
-        bg_rect = pygame.Rect(apple_rect.left,apple_rect.top,apple_rect.width + score_rect.width + 6,apple_rect.height)
-        pygame.draw.rect(self.screen,(167,209,61),bg_rect)
-        self.screen.blit(score_surface,score_rect)
-        self.screen.blit(self.apple,apple_rect)
-        pygame.draw.rect(self.screen,(56,74,12),bg_rect,2)
+        score_rect = score_surface.get_rect(center=(score_x, score_y))
+        apple_rect = self.apple.get_rect(midright=(score_rect.left, score_rect.centery))
+        bg_rect = pygame.Rect(apple_rect.left, apple_rect.top, apple_rect.width + score_rect.width + 6, apple_rect.height)
+        pygame.draw.rect(self.screen, (167,209,61), bg_rect)
+        self.screen.blit(score_surface, score_rect)
+        self.screen.blit(self.apple, apple_rect)
+        pygame.draw.rect(self.screen, (56,74,12), bg_rect, 2)
 
     def close(self):
         if self._pygame_initialized:
