@@ -69,7 +69,6 @@ class SnakeEnv(gym.Env):
 
         head_pos = self.snake[0]
         fruit_pos = self.fruit
-        # Compute Manhattan distance before move
         prev_dist = abs(head_pos.x - fruit_pos.x) + abs(head_pos.y - fruit_pos.y)
 
         action_map = [Vector2(1, 0), Vector2(0, -1), Vector2(-1, 0), Vector2(0, 1)]
@@ -83,7 +82,7 @@ class SnakeEnv(gym.Env):
             return self._get_obs(), -1, True, False, {}
 
         self.snake.insert(0, new_head)
-        reward = -0.01  # Step penalty for wandering
+        reward = -0.01
 
         new_dist = abs(new_head.x - fruit_pos.x) + abs(new_head.y - fruit_pos.y)
         if new_dist < prev_dist:

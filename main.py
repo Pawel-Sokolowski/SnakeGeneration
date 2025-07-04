@@ -9,13 +9,14 @@ import gymnasium as gym
 import snake_gym_env
 from tqdm import trange, tqdm
 from collections import deque
-import matplotlib.pyplot as plt  # <-- ADD THIS
+import matplotlib.pyplot as plt
 
 def create_dense_q_model(input_shape, num_actions):
     return keras.Sequential([
         layers.Input(shape=input_shape),
-        layers.Dense(8, activation='sigmoid'),
-        layers.Dense(16, activation='sigmoid'),
+        layers.Dense(64, activation='sigmoid'),
+        layers.Dense(64, activation='sigmoid'),
+        layers.Dense(32, activation='sigmoid'),
         layers.Dense(32, activation='sigmoid'),
         layers.Dense(num_actions, activation='softmax')
     ])
@@ -65,7 +66,7 @@ def main():
         rewards_history = deque(maxlen=max_memory_length)
         done_history = deque(maxlen=max_memory_length)
         episode_reward_history = deque(maxlen=100)
-        all_episode_rewards = []  # <-- ADD THIS
+        all_episode_rewards = []
         step_count = 0
 
         @tf.function
@@ -134,7 +135,7 @@ def main():
                     break
 
             episode_reward_history.append(episode_reward)
-            all_episode_rewards.append(episode_reward)  # <-- ADD THIS
+            all_episode_rewards.append(episode_reward)
             running_reward = np.mean(episode_reward_history) if episode_reward_history else 0.0
 
             if running_reward > 40:

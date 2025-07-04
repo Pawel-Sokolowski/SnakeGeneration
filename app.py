@@ -13,7 +13,6 @@ import snake_gym_env
 
 MODEL_DIR = "saved_models"
 
-
 class SnakeApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -101,7 +100,6 @@ class SnakeApp(tk.Tk):
         self.frame_idx += 1
         if self.frame_idx < len(self.frames):
             self.after(60, self.animate_snake)  # ~16 fps
-
 
 if __name__ == "__main__":
     app = SnakeApp()
