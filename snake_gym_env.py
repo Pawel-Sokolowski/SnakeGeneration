@@ -9,7 +9,7 @@ from gymnasium.envs.registration import register
 class SnakeEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 15}
 
-    def __init__(self, grid_size=50, render_mode="human"):
+    def __init__(self, grid_size=30,render_mode='human'):
         super().__init__()
         self.grid_size = grid_size
         self.cell_size = 40

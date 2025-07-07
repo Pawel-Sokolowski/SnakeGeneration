@@ -78,7 +78,7 @@ class SnakeApp(tk.Tk):
             action = np.argmax(model(tf.convert_to_tensor(np.expand_dims(obs, axis=0)), training=False).numpy())
             next_obs, reward, terminated, truncated, info = env.step(action)
             obs = np.array(next_obs, dtype=np.float32)
-            frame = env.render(mode="rgb_array")
+            frame = env.render()
             if frame is not None:
                 img = Image.fromarray(frame).resize((420, 420), Image.NEAREST)
                 self.frames.append(ImageTk.PhotoImage(img))

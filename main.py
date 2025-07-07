@@ -42,11 +42,11 @@ def param_grid_search(param_grid):
 def main():
     param_grid = {
         "n_episodes": [100_000],
-        "gamma": [0.90,0.95, 0.99],
+        "gamma": [0.90, 0.95, 0.99],
         "epsilon": [1.0],
         "epsilon_min": [0.05],
         "batch_size": [64],
-        "learning_rate": [0.0001, 0.0015, 0.002],
+        "learning_rate": [0.0015, 0.002],
     }
 
     for params in param_grid_search(param_grid):
