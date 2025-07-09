@@ -4,13 +4,13 @@ import numpy as np
 import pygame
 from pygame.math import Vector2
 import random
-from collections import deque
 from gymnasium.envs.registration import register
+from collections import deque
 
 class SnakeEnv(gym.Env):
-    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 15}
+    metadata = {"render_modes": ["human"], "render_fps": 15}
 
-    def __init__(self, grid_size=30, render_mode='human'):
+    def __init__(self, grid_size=20, render_mode="human"):
         super().__init__()
         self.grid_size = grid_size
         self.cell_size = 40
@@ -20,7 +20,7 @@ class SnakeEnv(gym.Env):
         self.max_snake_length = self.grid_size * self.grid_size
         obs_shape = (self.max_snake_length + 1, 2)
 
-        self.action_space = spaces.Discrete(4)  # Now 4 actions: 0, 1, 2, 3
+        self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(
             low=-1, high=self.grid_size-1, shape=obs_shape, dtype=np.int32
         )
@@ -31,15 +31,11 @@ class SnakeEnv(gym.Env):
         self.direction = None
         self.done = False
         self.score = 0
-        self.previous_action = None  # Track the previous action
-        self.previous_distance = None # Track the previous distance
-
-        # Load resources only once
-        if self.render_mode in ["human", "rgb_array"]:
-            self._init_pygame()
+        self.previous_action = None
+        self.previous_distance = None
 
     def _init_pygame(self):
-        if not self._pygame_initialized:
+        if self.render_mode == "human" and not self._pygame_initialized:
             pygame.init()
             pygame.mixer.pre_init(44100, -16, 2, 512)
             self.screen = pygame.display.set_mode((self.window_size, self.window_size))
@@ -64,66 +60,78 @@ class SnakeEnv(gym.Env):
             self._pygame_initialized = True
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed, options=options)
+        super().reset(seed=seed)
+        if self.render_mode == "human":
+            self._init_pygame()
         self.direction = Vector2(1, 0)
-        self.snake = deque([Vector2(5, 10), Vector2(4, 10), Vector2(3, 10)])  # Use deque
+        self.snake = deque([Vector2(5, 10), Vector2(4, 10), Vector2(3, 10)])
         self._randomize_fruit()
         self.done = False
         self.score = 0
-        self.previous_action = None  # Reset previous action
-
-        # Initialize previous_distance here
-        head_pos = self.snake[0]
-        fruit_pos = self.fruit
-        self.previous_distance = abs(head_pos.x - fruit_pos.x) + abs(head_pos.y - fruit_pos.y)
-
+        self.previous_action = None
+        self.previous_distance = None
+        self.step_counter = 0  # 🆕 Track episode length
         return self._get_obs(), {}
 
     def step(self, action):
         if self.done:
             return self._get_obs(), 0, True, False, {}
 
+        self.step_counter += 1  # ⏳ Count each step
+
         head_pos = self.snake[0]
         fruit_pos = self.fruit
         current_dist = abs(head_pos.x - fruit_pos.x) + abs(head_pos.y - fruit_pos.y)
+        reward = 0.0
 
         # Action map: 0=right, 1=up, 2=left, 3=down
         action_map = [Vector2(1, 0), Vector2(0, -1), Vector2(-1, 0), Vector2(0, 1)]
-
         new_direction = action_map[action]
 
         if self.previous_action is not None:
-            opposite_actions = {
-                0: 2,  # Right -> Left
-                1: 3,  # Up -> Down
-                2: 0,  # Left -> Right
-                3: 1  # Down -> Up
-            }
-            if action == opposite_actions.get(self.previous_action):
-                # Keep the same direction
+            opposite = {0: 2, 1: 3, 2: 0, 3: 1}
+            if action == opposite.get(self.previous_action):
                 new_direction = self.direction
 
-        new_head = self.snake[0] + self.direction
+        self.direction = new_direction
+        new_head = head_pos + self.direction
+
+        # 💥 Collision penalty
         if self._collision(new_head):
             self.done = True
-            return self._get_obs(), -1, True, False, {}
+            return self._get_obs(), -50, True, False, {}
 
-        self.snake.appendleft(new_head)  # Use appendleft
-        reward = -0.1
+        self.snake.appendleft(new_head)
+
+        # ⌛ Time penalty (scales with episode)
+        reward -= 0.05 * self.step_counter
 
         if new_head == self.fruit:
-            self.score += 10
-            reward += 10
+            self.score += 50
+            reward += 50
+
+            # 🎯 Fast collection bonus
+            if self.step_counter < 40:
+                reward += 10
+
             if self.render_mode == "human" and self._pygame_initialized:
                 self.crunch_sound.play()
             self._randomize_fruit()
         else:
             self.snake.pop()
 
-        # Reward for getting closer
-        if self.previous_distance is not None and current_dist < self.previous_distance:
-            reward += 1
-        # Update previous distance for the next step
+        # 🧭 Proximity reward
+        if self.previous_distance is not None:
+            delta = self.previous_distance - current_dist
+            if delta > 0:
+                reward += delta * 0.5
+            elif delta < 0:
+                reward -= abs(delta) * 0.2
+
+        # 🔁 Optional penalty for same action (slight encouragement to explore)
+        if self.previous_action is not None and action == self.previous_action:
+            reward -= 0.1
+
         self.previous_distance = current_dist
         self.previous_action = action
         return self._get_obs(), reward, self.done, False, {}
@@ -146,34 +154,26 @@ class SnakeEnv(gym.Env):
                 break
 
     def _get_obs(self):
-        snake_coords = np.array([(block.x, block.y) for block in self.snake], dtype=np.int32)
-        fruit_coord = np.array([self.fruit.x, self.fruit.y], dtype=np.int32)
-        padding_length = self.max_snake_length - len(snake_coords)
-        padding = np.full((padding_length, 2), -1, dtype=np.int32)
-        obs = np.concatenate([snake_coords, padding, fruit_coord.reshape(1, -1)])
 
+        body_coords = [(int(block.x), int(block.y)) for block in self.snake]
+        padding_length = self.max_snake_length - len(body_coords)
+        padded_coords = body_coords + [(-1, -1)] * padding_length
+        fruit_coord = [(int(self.fruit.x), int(self.fruit.y))]
+        obs = np.array(padded_coords + fruit_coord, dtype=np.int32)
         return obs
 
     def render(self):
-        if self.render_mode == "rgb_array":
-            self.screen.fill((175, 215, 70))
-            self._draw_grass()
-            self._draw_snake()
-            self._draw_fruit()
-            self._draw_score()
-            return np.transpose(
-                np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
-            )
-        elif self.render_mode == "human":
-            self.screen.fill((175, 215, 70))
-            self._draw_grass()
-            self._draw_snake()
-            self._draw_fruit()
-            self._draw_score()
-            pygame.display.update()
-            self.clock.tick(self.metadata["render_fps"])
-        else:
-            super().render()
+        if self.render_mode != "human":
+            return
+        if not self._pygame_initialized:
+            self._init_pygame()
+        self.screen.fill((175, 215, 70))
+        self._draw_grass()
+        self._draw_snake()
+        self._draw_fruit()
+        self._draw_score()
+        pygame.display.update()
+        self.clock.tick(self.metadata["render_fps"])
 
     def _draw_snake(self):
         self._update_head_graphics()
