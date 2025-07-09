@@ -8,13 +8,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="14c16625-e3c4-4104-acca-575ff43641c3" name="Changes" comment="Merge branch 'master' of https://github.com/Pawel-Sokolowski/SnakeGeneration">
-      <change afterPath="$PROJECT_DIR$/saved_models/model_ep100000_gamma09_epsilon10_lr00001.keras" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/saved_models/model_ep100000_gamma09_epsilon10_lr00001.png" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/SnakeGeneration.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/SnakeGeneration.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/saved_models/model_ep100000_gamma09_epsilon10_lr00001.keras" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/saved_models/model_ep100000_gamma09_epsilon10_lr00001.png" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/snake_gym_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/snake_gym_env.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -31,6 +29,7 @@
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+    <option name="UPDATE_TYPE" value="REBASE" />
   </component>
   <component name="GitHubPullRequestSearchHistory">{
   &quot;lastFilter&quot;: {
@@ -203,7 +202,15 @@
       <option name="project" value="LOCAL" />
       <updated>1751887511136</updated>
     </task>
-    <option name="localTasksCounter" value="9" />
+    <task id="LOCAL-00009" summary="Merge branch 'master' of https://github.com/Pawel-Sokolowski/SnakeGeneration">
+      <option name="closed" value="true" />
+      <created>1751887514628</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1751887514628</updated>
+    </task>
+    <option name="localTasksCounter" value="10" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">

@@ -44,6 +44,8 @@ class SnakeApp(tk.Tk):
 
         self.frames = []
         self.frame_idx = 0
+        self.playing = False  # Flag to control continuous play
+        self.model = None  # Store the loaded model
 
     def list_models(self):
         if not os.path.exists(MODEL_DIR):
@@ -65,41 +67,63 @@ class SnakeApp(tk.Tk):
             self.plot_label.image = None
 
     def play_snake(self):
+        if self.playing:
+            self.playing = False  # Stop the current game
+            return
+
+        self.playing = True  # Start a new game
         model_file = self.model_var.get()
         model_path = os.path.join(MODEL_DIR, model_file)
-        model = keras.models.load_model(model_path)
-
-        env = gym.make("Snake-v0", render_mode=None)
-        obs, _ = env.reset(seed=None)
-        obs = np.array(obs, dtype=np.float32)
-        self.frames = []
-        max_steps = 500
-        for _ in range(max_steps):
-            action = np.argmax(model(tf.convert_to_tensor(np.expand_dims(obs, axis=0)), training=False).numpy())
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            obs = np.array(next_obs, dtype=np.float32)
-            frame = env.render()
-            if frame is not None:
-                img = Image.fromarray(frame).resize((420, 420), Image.NEAREST)
-                self.frames.append(ImageTk.PhotoImage(img))
-            if terminated or truncated:
-                break
-        env.close()
-        self.frame_idx = 0
-        if not self.frames:
-            self.snake_canvas.config(text="No frames to display.", image='')
+        try:
+            self.model = keras.models.load_model(model_path)  # Load the model and store it in self.model
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load model: {e}")
+            self.playing = False
             return
-        self.animate_snake()
+
+        self.env = gym.make("Snake-v0", render_mode='rgb_array')  # Ensure render_mode is 'rgb_array'
+        self.obs, _ = self.env.reset(seed=None)
+        self.obs = np.array(self.obs, dtype=np.float32)
+        self.frames = []
+        self.frame_idx = 0
+        self.animate_snake()  # Start the animation loop
 
     def animate_snake(self):
-        if not self.frames or self.frame_idx >= len(self.frames):
+        if not self.playing:
+            if hasattr(self, 'env') and self.env:
+                self.env.close()
             return
-        frame = self.frames[self.frame_idx]
-        self.snake_canvas.config(image=frame, text='')
-        self.snake_canvas.image = frame
-        self.frame_idx += 1
-        if self.frame_idx < len(self.frames):
-            self.after(60, self.animate_snake)  # ~16 fps
+
+        try:
+            # Use self.model to make predictions
+            action = np.argmax(self.model(tf.convert_to_tensor(np.expand_dims(self.obs, axis=0)), training=False).numpy())
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
+            self.obs = np.array(next_obs, dtype=np.float32)
+            frame = self.env.render()
+
+            if frame is not None:
+                img = Image.fromarray(frame).resize((420, 420), Image.NEAREST)
+                photo = ImageTk.PhotoImage(img)
+                self.snake_canvas.config(image=photo, text='')
+                self.snake_canvas.image = photo
+            else:
+                print("Frame is None!")
+
+            if terminated or truncated:
+                print("Game Over! Resetting...")
+                self.env.close()
+                self.env = gym.make("Snake-v0", render_mode='rgb_array')
+                self.obs, _ = self.env.reset(seed=None)
+                self.obs = np.array(self.obs, dtype=np.float32)
+
+            self.after(60, self.animate_snake)  # Schedule the next frame
+        except Exception as e:
+            messagebox.showerror("Error", f"Error during gameplay: {e}")
+            self.playing = False
+            if hasattr(self, 'env') and self.env:
+                self.env.close()
+            if self.model is not None:
+                self.model = None
 
 if __name__ == "__main__":
     app = SnakeApp()
