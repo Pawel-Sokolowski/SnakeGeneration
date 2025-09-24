@@ -1,6 +1,37 @@
-# Snake Deep Q-Learning Agent
+# Snake Deep Q-Learning Agent - GTX 1070 Optimized
 
-This repository contains a Deep Q-Learning (DQN) implementation for playing the classic Snake game, using TensorFlow, Keras, and a custom Gymnasium environment built with Pygame.
+This repository contains optimized Deep Q-Learning (DQN) implementations for playing Snake, specifically designed to run efficiently on a GTX 1070 with 8GB VRAM while providing fast training times.
+
+## 🚀 GTX 1070 Optimizations
+
+### Model Architectures
+- **SnakeCNNQNet**: Lightweight CNN with 1D convolutions (~139K parameters, 0.5MB)
+- **SnakeMLPQNet**: Simple MLP baseline (~31-82K parameters, 0.1-0.3MB depending on grid size)
+
+### Memory Optimizations
+- **Grid Size Options**: 15x15, 20x20 (vs original 40x40) for faster training
+- **Batch Sizes**: 256, 512 (vs original 4096) to fit in 8GB VRAM
+- **Environment Count**: 8, 16 (vs original 64) for balanced performance
+- **Buffer Size**: 50K (vs 100K) for reduced memory usage
+- **Single GPU Training**: No DDP overhead, optimized for single GPU
+
+### Training Optimizations
+- **Enhanced Reward System**: +10 for fruit, -10 for collision, +0.5 for moving closer
+- **Faster Convergence**: Improved reward shaping and epsilon decay
+- **Early Stopping**: Automatic stopping when target performance reached
+- **Memory Monitoring**: Real-time VRAM usage tracking
+- **Gradient Clipping**: Stable training with max_norm=1.0
+
+## 📊 Performance Comparison
+
+| Configuration | Parameters | VRAM Usage | Training Time | Target Score |
+|--------------|------------|------------|---------------|--------------|
+| CNN 15x15    | 139K       | ~2.4MB     | ~1-2 hours    | 15+ points   |
+| CNN 20x20    | 139K       | ~3.4MB     | ~2-3 hours    | 25+ points   |
+| MLP 15x15    | 31K        | ~1.4MB     | ~30-60 min    | 15+ points   |
+| MLP 20x20    | 54K        | ~2.5MB     | ~1-2 hours    | 25+ points   |
+
+*Times estimated for GTX 1070, actual performance may vary*
 
 ## Features
 
@@ -68,19 +99,49 @@ Rewards:
 
 The agent will train for up to 100,000 episodes or until a running average reward threshold is reached. Once training is complete, you can watch the trained agent play the game visually.
 
-## Usage
+## Quick Start
 
-1. **Prepare Assets**: Ensure you have the required image, sound, and font files in the appropriate `Graphics/`, `Sound/`, and `Font/` directories.
-   
-2. **Run Training**:
+### 1. Install Dependencies
+```bash
+pip install -r requirements
+```
 
-   ```bash
-   python main.py
-   ```
+### 2. Run Model Demo
+```bash
+python demo.py  # See model comparison and quick test
+```
 
-   The agent will train and periodically print progress. After training, the agent will play the game using the trained model, rendering it in a window.
+### 3. Start Training
+```bash
+python main.py  # Train multiple model configurations
+```
 
-3. **Stop Rendering**: Press `Ctrl+C` to stop the rendering loop.
+### 4. Monitor Training
+The script will automatically:
+- Train CNN and MLP models with different configurations
+- Save best models to `saved_models/` directory
+- Generate training curves as PNG files
+- Display memory usage and performance metrics
+
+## 🎮 Model Selection Guide
+
+**For fastest training (recommended for quick experiments):**
+- Model: MLP
+- Grid size: 15x15
+- Batch size: 256
+- Training time: ~30-60 minutes
+
+**For best performance:**
+- Model: CNN
+- Grid size: 20x20  
+- Batch size: 512
+- Training time: ~2-3 hours
+
+**For balanced approach:**
+- Model: CNN
+- Grid size: 15x15
+- Batch size: 256
+- Training time: ~1-2 hours
 
 ## Customization
 
