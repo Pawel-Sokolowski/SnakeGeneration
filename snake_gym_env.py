@@ -83,18 +83,20 @@ class SnakeEnv(gym.Env):
         new_head = self.snake[0] + self.direction
         if self._collision(new_head):
             self.done = True
-            return self._get_obs(), -1, True, False, {}
+            return self._get_obs(), -10, True, False, {}  # Increased collision penalty
 
         self.snake.insert(0, new_head)
-        reward = -0.01
+        reward = -0.005  # Reduced time penalty
 
         new_dist = abs(new_head.x - fruit_pos.x) + abs(new_head.y - fruit_pos.y)
         if new_dist < prev_dist:
-            reward += 0.3
+            reward += 0.5  # Increased reward for getting closer
+        else:
+            reward -= 0.1  # Small penalty for moving away
 
         if new_head == self.fruit:
             self.score += 1
-            reward += 1
+            reward += 10  # Increased fruit reward
             if self.render_mode == "human" and self._pygame_initialized:
                 self.crunch_sound.play()
             self._randomize_fruit()
@@ -224,4 +226,5 @@ register(
     id="Snake-v0",
     entry_point="snake_gym_env:SnakeEnv",
     max_episode_steps=1000,
+    kwargs={"grid_size": 20}  # Default grid size
 )
