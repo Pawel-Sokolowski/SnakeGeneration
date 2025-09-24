@@ -7,9 +7,9 @@ import random
 from gymnasium.envs.registration import register
 
 class SnakeEnv(gym.Env):
-    metadata = {"render_modes": ["human"], "render_fps": 15}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 15}
 
-    def __init__(self, grid_size=40,render_mode='human'):
+    def __init__(self, grid_size=20, render_mode='human'):
         super().__init__()
         self.grid_size = grid_size
         self.cell_size = 40
@@ -225,6 +225,5 @@ class SnakeEnv(gym.Env):
 register(
     id="Snake-v0",
     entry_point="snake_gym_env:SnakeEnv",
-    max_episode_steps=1000,
-    kwargs={"grid_size": 20}  # Default grid size
+    max_episode_steps=1000
 )
