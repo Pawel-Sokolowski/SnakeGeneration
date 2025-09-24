@@ -167,6 +167,10 @@ def train_single_gpu(params):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    if not torch.cuda.is_available():
+        print("⚠️  CUDA not available, using CPU (training will be slower)")
+        print("   For GTX 1070 training, ensure CUDA drivers are installed")
+    
     # Create environments with smaller grid size
     envs = [gym.make("Snake-v0", render_mode=None, grid_size=params["grid_size"]) for _ in range(params["env_count"])]
     seq_len, feature_dim = envs[0].observation_space.shape
@@ -187,7 +191,8 @@ def train_single_gpu(params):
     
     # Print model size
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
+    model_size_mb = total_params * 4 / 1024 / 1024
+    print(f"Model parameters: {total_params:,} ({model_size_mb:.1f} MB)")
 
     optimizer = optim.Adam(model.parameters(), lr=params["learning_rate"])
     loss_fn = nn.HuberLoss()
@@ -196,7 +201,10 @@ def train_single_gpu(params):
     # Training parameters optimized for faster convergence
     eps, eps_min, eps_decay = 1.0, 0.05, 0.999995  # Faster epsilon decay
     gamma, batch_size = params["gamma"], params["batch_size"]
-    train_freq, sync_freq, max_steps, n_episodes = 4, 500, 200, 10000  # Reduced steps and episodes
+    train_freq, sync_freq, max_steps = 4, 500, 200  # Reduced steps
+    
+    # Adjust episodes based on device (CPU needs fewer episodes for testing)
+    n_episodes = 2000 if device.type == "cuda" else 500
     
     step_count = 0
     rewards_history, all_rewards = deque(maxlen=100), []
@@ -208,7 +216,7 @@ def train_single_gpu(params):
         obs_batch.append(torch.tensor(obs.astype(np.float32)))
     
     start_time = time.time()
-    print(f"\nStarting training with {params['env_count']} environments...")
+    print(f"\nStarting training with {params['env_count']} environments for {n_episodes} episodes...")
 
     for ep in range(n_episodes):
         ep_reward, ep_start = [0.0] * len(envs), time.time()
@@ -251,7 +259,7 @@ def train_single_gpu(params):
         all_rewards.append(avg_reward)
         
         # Progress reporting
-        if ep % 20 == 0:
+        if ep % 20 == 0 or ep < 10:
             elapsed = time.time() - start_time
             mem_alloc, mem_reserved = get_memory_usage(device)
             avg_100 = np.mean(list(rewards_history))
@@ -259,7 +267,7 @@ def train_single_gpu(params):
 
         # Early stopping condition (adjusted for smaller grid)
         target_score = 15 if params["grid_size"] <= 15 else 25
-        if np.mean(rewards_history) > target_score:
+        if len(rewards_history) >= 50 and np.mean(rewards_history) > target_score:
             print(f"🎉 Solved at episode {ep}! Average reward: {np.mean(rewards_history):.2f}")
             break
 

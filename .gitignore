@@ -1,5 +1,19 @@
-/.venv/
+./.venv/
 __pycache__/
 *.pyc
 .idea/
 /.idea
+
+# Model files and training outputs
+saved_models/
+*.pt
+*.png
+
+# Temporary files
+*.tmp
+*.log
+demo_model.pt
+
+# OS files
+.DS_Store
+Thumbs.db
