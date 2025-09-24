@@ -13,6 +13,7 @@ saved_models/
 *.tmp
 *.log
 demo_model.pt
+test_model.pt
 
 # OS files
 .DS_Store
