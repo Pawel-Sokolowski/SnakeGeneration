@@ -1,229 +1,316 @@
-import gymnasium as gym
-from gymnasium import spaces
+import random
+from typing import Any, Dict, Optional, Tuple, List
+
 import numpy as np
 import pygame
 from pygame.math import Vector2
-import random
+import gymnasium as gym
+from gymnasium import spaces
 from gymnasium.envs.registration import register
+
 
 class SnakeEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 15}
 
-    def __init__(self, grid_size=20, render_mode='human'):
+    def __init__(self, grid_size: int = 20, render_mode: Optional[str] = None, seed: Optional[int] = None):
         super().__init__()
-        self.grid_size = grid_size
+        self.grid_size = int(grid_size)
         self.cell_size = 40
         self.window_size = self.grid_size * self.cell_size
         self.render_mode = render_mode
+        self._rng = random.Random(seed)
 
+        # Max snake length = all cells
         self.max_snake_length = self.grid_size * self.grid_size
-        obs_shape = (self.max_snake_length + 1, 2)
 
-        self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(
-            low=-1, high=self.grid_size-1, shape=obs_shape, dtype=np.int32
+        # coords: snake body (padded) + fruit
+        coords_shape = (self.max_snake_length + 1, 2)
+        coords_space = spaces.Box(
+            low=-1,
+            high=self.grid_size - 1,
+            shape=coords_shape,
+            dtype=np.int32
         )
 
+        # features: [head_x, head_y, apple_dx, apple_dy, dir_x, dir_y, danger_front, danger_left, danger_right]
+        features_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(9,),
+            dtype=np.float32
+        )
+
+        self.observation_space = spaces.Dict({
+            "coords": coords_space,
+            "features": features_space
+        })
+
+        self.action_space = spaces.Discrete(4)  # right, up, left, down
+
+        # pygame
         self._pygame_initialized = False
-        self.snake = None
-        self.fruit = None
-        self.direction = None
-        self.done = False
-        self.score = 0
+        self._assets_loaded = False
 
-    def _init_pygame(self):
-        if self.render_mode == "human" and not self._pygame_initialized:
-            pygame.init()
-            pygame.mixer.pre_init(44100, -16, 2, 512)
-            self.screen = pygame.display.set_mode((self.window_size, self.window_size))
-            self.clock = pygame.time.Clock()
-            self.font = pygame.font.Font('Font/PoetsenOne-Regular.ttf', 25)
-            self.head_up = pygame.image.load('Graphics/head_up.png').convert_alpha()
-            self.head_down = pygame.image.load('Graphics/head_down.png').convert_alpha()
-            self.head_right = pygame.image.load('Graphics/head_right.png').convert_alpha()
-            self.head_left = pygame.image.load('Graphics/head_left.png').convert_alpha()
-            self.tail_up = pygame.image.load('Graphics/tail_up.png').convert_alpha()
-            self.tail_down = pygame.image.load('Graphics/tail_down.png').convert_alpha()
-            self.tail_right = pygame.image.load('Graphics/tail_right.png').convert_alpha()
-            self.tail_left = pygame.image.load('Graphics/tail_left.png').convert_alpha()
-            self.body_vertical = pygame.image.load('Graphics/body_vertical.png').convert_alpha()
-            self.body_horizontal = pygame.image.load('Graphics/body_horizontal.png').convert_alpha()
-            self.body_tr = pygame.image.load('Graphics/body_tr.png').convert_alpha()
-            self.body_tl = pygame.image.load('Graphics/body_tl.png').convert_alpha()
-            self.body_br = pygame.image.load('Graphics/body_br.png').convert_alpha()
-            self.body_bl = pygame.image.load('Graphics/body_bl.png').convert_alpha()
-            self.apple = pygame.image.load('Graphics/apple.png').convert_alpha()
-            self.crunch_sound = pygame.mixer.Sound('Sound/crunch.wav')
-            self._pygame_initialized = True
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if self.render_mode == "human":
-            self._init_pygame()
+        # game state
+        self.snake: List[Vector2] = []
+        self.fruit: Vector2 = Vector2(-1, -1)
         self.direction = Vector2(1, 0)
-        self.snake = [Vector2(5, 10), Vector2(4, 10), Vector2(3, 10)]
-        self._randomize_fruit()
-        self.done = False
+        self.terminated = False
+        self.truncated = False
         self.score = 0
+
+    # -------------------------
+    # Seeding & reset
+    # -------------------------
+    def seed(self, seed: Optional[int] = None):
+        self._rng = random.Random(seed)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if seed is not None:
+            self.seed(seed)
+        self._init_pygame()
+
+        mid = self.grid_size // 2
+        self.direction = Vector2(1, 0)
+        self.snake = [
+            Vector2(mid + 1, mid),
+            Vector2(mid, mid),
+            Vector2(mid - 1, mid)
+        ]
+
+        self._randomize_fruit()
+        self.terminated = False
+        self.truncated = False
+        self.score = 0
+
         return self._get_obs(), {}
 
-    def step(self, action):
-        if self.done:
-            return self._get_obs(), 0, True, False, {}
+    # -------------------------
+    # Step with shaping
+    # -------------------------
+    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict]:
+        if self.terminated or self.truncated:
+            return self._get_obs(), 0.0, True, False, {}
 
-        head_pos = self.snake[0]
-        fruit_pos = self.fruit
-        prev_dist = abs(head_pos.x - fruit_pos.x) + abs(head_pos.y - fruit_pos.y)
+        # Map action to direction
+        action_map = [
+            Vector2(1, 0),   # right
+            Vector2(0, -1),  # up
+            Vector2(-1, 0),  # left
+            Vector2(0, 1)    # down
+        ]
+        new_dir = action_map[int(action)]
 
-        action_map = [Vector2(1, 0), Vector2(0, -1), Vector2(-1, 0), Vector2(0, 1)]
-        new_direction = action_map[action]
-        if not (new_direction + self.direction == Vector2(0, 0)):
-            self.direction = new_direction
+        # Prevent reversing
+        if new_dir + self.direction != Vector2(0, 0):
+            self.direction = new_dir
 
-        new_head = self.snake[0] + self.direction
+        head = self.snake[0]
+        new_head = head + self.direction
+
+        # Collision check
         if self._collision(new_head):
-            self.done = True
-            return self._get_obs(), -10, True, False, {}  # Increased collision penalty
+            self.terminated = True
+            return self._get_obs(), -1.0, True, False, {"collision": True}
 
+        # Distance to fruit before and after move
+        fruit = self.fruit
+        prev_dist = abs(head.x - fruit.x) + abs(head.y - fruit.y)
+        new_dist = abs(new_head.x - fruit.x) + abs(new_head.y - fruit.y)
+
+        # Move snake
         self.snake.insert(0, new_head)
-        reward = -0.005  # Reduced time penalty
 
-        new_dist = abs(new_head.x - fruit_pos.x) + abs(new_head.y - fruit_pos.y)
-        if new_dist < prev_dist:
-            reward += 0.5  # Increased reward for getting closer
-        else:
-            reward -= 0.1  # Small penalty for moving away
+        reward = 0.0
 
+        # Fruit eaten
         if new_head == self.fruit:
             self.score += 1
-            reward += 10  # Increased fruit reward
-            if self.render_mode == "human" and self._pygame_initialized:
-                self.crunch_sound.play()
+            reward += 1.0
             self._randomize_fruit()
         else:
             self.snake.pop()
 
-        return self._get_obs(), reward, self.done, False, {}
+        # Distance shaping
+        if new_dist < prev_dist:
+            reward += 0.05
+        elif new_dist > prev_dist:
+            reward -= 0.05
 
-    def _collision(self, pos):
+        # Tiny time penalty
+        reward -= 0.001
+
+        if len(self.snake) >= self.max_snake_length:
+            self.truncated = True
+
+        return self._get_obs(), float(reward), self.terminated, self.truncated, {"score": self.score}
+
+    # -------------------------
+    # Collision & fruit
+    # -------------------------
+    def _collision(self, pos: Vector2) -> bool:
+        # wall
         if not (0 <= pos.x < self.grid_size and 0 <= pos.y < self.grid_size):
             return True
-        if pos in self.snake[1:]:
-            return True
+        # body (exclude head)
+        for b in self.snake[1:]:
+            if pos == b:
+                return True
         return False
 
     def _randomize_fruit(self):
-        while True:
-            x = random.randint(0, self.grid_size - 1)
-            y = random.randint(0, self.grid_size - 1)
-            fruit = Vector2(x, y)
-            if fruit not in self.snake:
-                self.fruit = fruit
-                break
+        free = {(x, y) for x in range(self.grid_size) for y in range(self.grid_size)}
+        for b in self.snake:
+            free.discard((int(b.x), int(b.y)))
+        if not free:
+            self.fruit = Vector2(-1, -1)
+            return
+        fx, fy = self._rng.choice(list(free))
+        self.fruit = Vector2(fx, fy)
 
-    def _get_obs(self):
-        body_coords = [(int(block.x), int(block.y)) for block in self.snake]
-        padding_length = self.max_snake_length - len(body_coords)
-        padded_coords = body_coords + [(-1, -1)] * padding_length
+    # -------------------------
+    # Observations
+    # -------------------------
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        # coords
+        body_coords = [(int(b.x), int(b.y)) for b in self.snake]
+        padding = self.max_snake_length - len(body_coords)
+        padded = body_coords + [(-1, -1)] * padding
         fruit_coord = [(int(self.fruit.x), int(self.fruit.y))]
-        obs = np.array(padded_coords + fruit_coord, dtype=np.int32)
-        return obs
+        coords = np.array(padded + fruit_coord, dtype=np.int32)
+
+        features = self._coords_to_features(coords)
+        return {"coords": coords, "features": features}
+
+    def _coords_to_features(self, coords: np.ndarray) -> np.ndarray:
+        head = coords[0]
+        fruit = coords[-1]
+
+        # body excluding head
+        body = []
+        for (x, y) in coords[1:-1]:
+            if x == -1:
+                break
+            body.append((int(x), int(y)))
+
+        # direction from neck
+        if len(coords) >= 2 and coords[1][0] != -1:
+            neck = coords[1]
+            dir_x = head[0] - neck[0]
+            dir_y = head[1] - neck[1]
+        else:
+            dir_x, dir_y = 1, 0
+
+        # apple delta
+        dx = fruit[0] - head[0]
+        dy = fruit[1] - head[1]
+
+        def danger(x, y):
+            if not (0 <= x < self.grid_size and 0 <= y < self.grid_size):
+                return 1.0
+            if (x, y) in body:
+                return 1.0
+            return 0.0
+
+        hx, hy = dir_x, dir_y
+        front = (head[0] + hx, head[1] + hy)
+        left = (head[0] - hy, head[1] + hx)
+        right = (head[0] + hy, head[1] - hx)
+
+        denom = max(1, self.grid_size - 1)
+
+        return np.array([
+            head[0] / denom,
+            head[1] / denom,
+            dx / denom,
+            dy / denom,
+            hx, hy,
+            danger(*front),
+            danger(*left),
+            danger(*right)
+        ], dtype=np.float32)
+
+    # -------------------------
+    # Rendering
+    # -------------------------
+    def _init_pygame(self):
+        if self.render_mode is None or self._pygame_initialized:
+            return
+
+        pygame.init()
+        if self.render_mode == "rgb_array":
+            self.screen = pygame.Surface((self.window_size, self.window_size))
+        else:
+            self.screen = pygame.display.set_mode((self.window_size, self.window_size))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(None, 25)
+        self._pygame_initialized = True
 
     def render(self):
-        if self.render_mode != "human":
-            return
-        if not self._pygame_initialized:
-            self._init_pygame()
-        self.screen.fill((175, 215, 70))
-        self._draw_grass()
-        self._draw_snake()
-        self._draw_fruit()
-        self._draw_score()
-        pygame.display.update()
-        self.clock.tick(self.metadata["render_fps"])
+        if self.render_mode is None:
+            return None
 
-    def _draw_snake(self):
-        self._update_head_graphics()
-        self._update_tail_graphics()
-        for index, block in enumerate(self.snake):
-            x_pos = int(block.x * self.cell_size)
-            y_pos = int(block.y * self.cell_size)
-            block_rect = pygame.Rect(x_pos, y_pos, self.cell_size, self.cell_size)
-            if index == 0:
-                self.screen.blit(self.head, block_rect)
-            elif index == len(self.snake) - 1:
-                self.screen.blit(self.tail, block_rect)
-            else:
-                prev = self.snake[index+1] - block
-                next = self.snake[index-1] - block
-                if prev.x == next.x:
-                    self.screen.blit(self.body_vertical, block_rect)
-                elif prev.y == next.y:
-                    self.screen.blit(self.body_horizontal, block_rect)
-                else:
-                    if (prev.x == -1 and next.y == -1) or (prev.y == -1 and next.x == -1):
-                        self.screen.blit(self.body_tl, block_rect)
-                    elif (prev.x == -1 and next.y == 1) or (prev.y == 1 and next.x == -1):
-                        self.screen.blit(self.body_bl, block_rect)
-                    elif (prev.x == 1 and next.y == -1) or (prev.y == -1 and next.x == 1):
-                        self.screen.blit(self.body_tr, block_rect)
-                    elif (prev.x == 1 and next.y == 1) or (prev.y == 1 and next.x == 1):
-                        self.screen.blit(self.body_br, block_rect)
+        self._init_pygame()
+        surface = self.screen
+        surface.fill((175, 215, 70))
 
-    def _update_head_graphics(self):
-        if len(self.snake) < 2:
-            self.head = self.head_right
-            return
-        head_relation = self.snake[1] - self.snake[0]
-        if head_relation == Vector2(1,0): self.head = self.head_left
-        elif head_relation == Vector2(-1,0): self.head = self.head_right
-        elif head_relation == Vector2(0,1): self.head = self.head_up
-        elif head_relation == Vector2(0,-1): self.head = self.head_down
-        else: self.head = self.head_right
-
-    def _update_tail_graphics(self):
-        if len(self.snake) < 2:
-            self.tail = self.tail_right
-            return
-        tail_relation = self.snake[-2] - self.snake[-1]
-        if tail_relation == Vector2(1,0): self.tail = self.tail_left
-        elif tail_relation == Vector2(-1,0): self.tail = self.tail_right
-        elif tail_relation == Vector2(0,1): self.tail = self.tail_up
-        elif tail_relation == Vector2(0,-1): self.tail = self.tail_down
-        else: self.tail = self.tail_right
-
-    def _draw_fruit(self):
-        fruit_rect = pygame.Rect(int(self.fruit.x * self.cell_size), int(self.fruit.y * self.cell_size), self.cell_size, self.cell_size)
-        self.screen.blit(self.apple, fruit_rect)
-
-    def _draw_grass(self):
         grass_color = (167, 209, 61)
         for row in range(self.grid_size):
             for col in range(self.grid_size):
                 if (row + col) % 2 == 0:
-                    grass_rect = pygame.Rect(col * self.cell_size, row * self.cell_size, self.cell_size, self.cell_size)
-                    pygame.draw.rect(self.screen, grass_color, grass_rect)
+                    rect = pygame.Rect(
+                        col * self.cell_size,
+                        row * self.cell_size,
+                        self.cell_size,
+                        self.cell_size
+                    )
+                    pygame.draw.rect(surface, grass_color, rect)
 
-    def _draw_score(self):
-        score_text = str(self.score)
-        score_surface = self.font.render(score_text, True, (56,74,12))
-        score_x = int(self.cell_size * self.grid_size - 60)
-        score_y = int(self.cell_size * self.grid_size - 40)
-        score_rect = score_surface.get_rect(center=(score_x, score_y))
-        apple_rect = self.apple.get_rect(midright=(score_rect.left, score_rect.centery))
-        bg_rect = pygame.Rect(apple_rect.left, apple_rect.top, apple_rect.width + score_rect.width + 6, apple_rect.height)
-        pygame.draw.rect(self.screen, (167,209,61), bg_rect)
-        self.screen.blit(score_surface, score_rect)
-        self.screen.blit(self.apple, apple_rect)
-        pygame.draw.rect(self.screen, (56,74,12), bg_rect, 2)
+        # fruit
+        if self.fruit.x >= 0:
+            fx = int(self.fruit.x * self.cell_size)
+            fy = int(self.fruit.y * self.cell_size)
+            rect = pygame.Rect(fx, fy, self.cell_size, self.cell_size)
+            pygame.draw.rect(surface, (255, 0, 0), rect)
+
+        # snake
+        for i, block in enumerate(self.snake):
+            x_pos = int(block.x * self.cell_size)
+            y_pos = int(block.y * self.cell_size)
+            rect = pygame.Rect(x_pos, y_pos, self.cell_size, self.cell_size)
+            color = (0, 100, 0) if i == 0 else (0, 150, 0)
+            pygame.draw.rect(surface, color, rect)
+
+        # score
+        try:
+            score_surface = self.font.render(str(self.score), True, (56, 74, 12))
+            surface.blit(score_surface, (5, 5))
+        except Exception:
+            pass
+
+        if self.render_mode == "human":
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+            return None
+        elif self.render_mode == "rgb_array":
+            arr = pygame.surfarray.array3d(surface)
+            return np.transpose(arr, (1, 0, 2))
+        else:
+            return None
 
     def close(self):
         if self._pygame_initialized:
-            pygame.quit()
+            try:
+                pygame.quit()
+            except Exception:
+                pass
             self._pygame_initialized = False
+            self._assets_loaded = False
 
+
+# Register environment
 register(
     id="Snake-v0",
     entry_point="snake_gym_env:SnakeEnv",
-    max_episode_steps=1000
+    max_episode_steps=2000
 )

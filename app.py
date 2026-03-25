@@ -1,301 +1,353 @@
+# app.py
 #!/usr/bin/env python3
 """
-Snake Model Visualizer - Simplified GUI App
-Choose trained models and grid size to run the Snake AI
+Tkinter GUI to load a saved Snake model and show it playing.
+- Loads checkpoints saved as dict with 'model_state_dict', 'input_dim', 'num_actions', 'grid_size'
+- Runs a deterministic episode (epsilon=0) and displays frames in the GUI
+- Background thread for stepping so UI remains responsive
 """
-
 import os
-import sys
+import json
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
-import numpy as np
 from PIL import Image, ImageTk
+import numpy as np
 import torch
 import torch.nn as nn
 import gymnasium as gym
-import snake_gym_env
 
+import snake_gym_env  # registers Snake-v0
 
-# Model directory
 MODEL_DIR = "saved_models"
+DEFAULT_GRID = 20
 
 
-# Simple MLP Q-Network (must match training model)
+# Simple MLP matching training model
 class SnakeQNet(nn.Module):
-    def __init__(self, seq_len, feature_dim, num_actions):
+    def __init__(self, input_dim: int, num_actions: int):
         super().__init__()
-        input_size = seq_len * feature_dim
-        
-        self.flatten = nn.Flatten()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 128),
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, num_actions)
         )
 
     def forward(self, x):
-        x = self.flatten(x)
-        return self.network(x)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        return self.net(x)
 
 
-class SnakeApp(tk.Tk):
+def safe_torch_load(path: str, device: torch.device):
+    """
+    Try normal torch.load; if it fails with weights-only restrictions, prompt user and optionally try full load.
+    """
+    try:
+        ckpt = torch.load(path, map_location=device)
+        return ckpt
+    except Exception as e:
+        msg = str(e)
+        if "Weights only load failed" in msg or "Unsupported global" in msg or "not an allowed global" in msg:
+            proceed = messagebox.askyesno(
+                "Load fallback",
+                "This checkpoint requires a full load to restore non-weight objects. "
+                "Full load can execute code from the file. Proceed only if you trust the file."
+            )
+            if proceed:
+                try:
+                    ckpt = torch.load(path, map_location=device, weights_only=False)
+                    return ckpt
+                except Exception:
+                    pass
+        raise
+
+
+def obs_to_features_for_gui(obs, grid_size):
+    """
+    Mirror the environment's features extractor. Prefer 'features' key if present.
+    """
+    if isinstance(obs, dict) and 'features' in obs:
+        return np.asarray(obs['features'], dtype=np.float32)
+
+    # fallback to coords parsing
+    head = (0, 0)
+    fruit = (0, 0)
+    body = []
+    if isinstance(obs, dict) and 'coords' in obs:
+        coords = np.asarray(obs['coords'])
+        valid_mask = ~((coords[:, 0] == -1) & (coords[:, 1] == -1))
+        valid_coords = coords[valid_mask]
+        if valid_coords.shape[0] >= 1:
+            head = (int(valid_coords[0, 0]), int(valid_coords[0, 1]))
+        if valid_coords.shape[0] >= 2:
+            body = [tuple(map(int, p)) for p in valid_coords]
+            fruit = (int(valid_coords[-1, 0]), int(valid_coords[-1, 1]))
+    else:
+        try:
+            arr = np.asarray(obs)
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                head = (int(arr[0, 0]), int(arr[0, 1]))
+                fruit = (int(arr[-1, 0]), int(arr[-1, 1]))
+                body = [tuple(map(int, p)) for p in arr[:-1] if not (int(p[0]) == -1 and int(p[1]) == -1)]
+        except Exception:
+            pass
+
+    if len(body) >= 2:
+        neck = body[1]
+        dir_x = int(head[0] - neck[0])
+        dir_y = int(head[1] - neck[1])
+    else:
+        dir_x, dir_y = 1, 0
+
+    apple_dx = int(fruit[0] - head[0])
+    apple_dy = int(fruit[1] - head[1])
+
+    def is_collision(pos):
+        x, y = pos
+        if not (0 <= x < grid_size and 0 <= y < grid_size):
+            return True
+        if (x, y) in body:
+            return True
+        return False
+
+    hx, hy = dir_x, dir_y
+    front = (int(head[0] + hx), int(head[1] + hy))
+    left = (int(head[0] - hy), int(head[1] + hx))
+    right = (int(head[0] + hy), int(head[1] - hx))
+
+    danger_front = 1.0 if is_collision(front) else 0.0
+    danger_left = 1.0 if is_collision(left) else 0.0
+    danger_right = 1.0 if is_collision(right) else 0.0
+
+    denom = max(1, grid_size - 1)
+    features = np.array([
+        head[0] / denom,
+        head[1] / denom,
+        apple_dx / denom,
+        apple_dy / denom,
+        hx, hy,
+        danger_front, danger_left, danger_right
+    ], dtype=np.float32)
+    return features
+
+
+class SnakeViewerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Snake AI - Model Selector")
-        self.geometry("800x600")
-        self.resizable(True, True)
-        
-        # Device setup
+        self.title("Snake Viewer")
+        self.geometry("1000x700")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.setup_ui()
+        self.model = None
+        self.model_meta = None
+        self.env = None
+        self.play_thread = None
+        self.playing = False
+        self.frame_image = None
+
+        self._build_ui()
         self.refresh_models()
 
-    def setup_ui(self):
-        """Setup the user interface"""
-        # Title
-        title_frame = tk.Frame(self)
-        title_frame.pack(fill=tk.X, pady=10)
-        
-        title_label = tk.Label(title_frame, text="🐍 Snake AI Model Selector", 
-                              font=("Arial", 16, "bold"))
-        title_label.pack()
+    def _build_ui(self):
+        top = tk.Frame(self)
+        top.pack(fill=tk.X, padx=8, pady=6)
 
-        # Controls frame
-        controls_frame = tk.Frame(self)
-        controls_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        # Model selection
-        model_frame = tk.Frame(controls_frame)
-        model_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(model_frame, text="Select Model:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+        tk.Label(top, text="Model:").pack(side=tk.LEFT)
         self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(model_frame, textvariable=self.model_var, 
-                                       width=50, state="readonly")
-        self.model_combo.pack(side=tk.LEFT, padx=(10, 5), fill=tk.X, expand=True)
-        
-        # Refresh button
-        refresh_btn = tk.Button(model_frame, text="Refresh", command=self.refresh_models)
-        refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self.model_combo = ttk.Combobox(top, textvariable=self.model_var, width=60, state="readonly")
+        self.model_combo.pack(side=tk.LEFT, padx=6)
+        tk.Button(top, text="Refresh", command=self.refresh_models).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Load", command=self.load_selected_model).pack(side=tk.LEFT, padx=4)
 
-        # Grid size selection
-        size_frame = tk.Frame(controls_frame)
-        size_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(size_frame, text="Grid Size:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        self.grid_var = tk.StringVar(value="20")
-        self.grid_combo = ttk.Combobox(size_frame, textvariable=self.grid_var, 
-                                      values=["10", "15", "20", "25", "30"], 
-                                      width=10, state="readonly")
-        self.grid_combo.pack(side=tk.LEFT, padx=(10, 0))
+        right_controls = tk.Frame(top)
+        right_controls.pack(side=tk.RIGHT)
+        tk.Button(right_controls, text="Run", command=self.start_run).pack(side=tk.LEFT, padx=4)
+        tk.Button(right_controls, text="Pause", command=self.pause_run).pack(side=tk.LEFT, padx=4)
+        tk.Button(right_controls, text="Step", command=self.step_once).pack(side=tk.LEFT, padx=4)
 
-        # Action buttons
-        button_frame = tk.Frame(controls_frame)
-        button_frame.pack(fill=tk.X, pady=10)
-        
-        self.plot_btn = tk.Button(button_frame, text="📊 Show Learning Curve", 
-                                 command=self.show_learning_curve, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
-        self.plot_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.play_btn = tk.Button(button_frame, text="🎮 Play Snake", 
-                                 command=self.play_snake, bg="#2196F3", fg="white", font=("Arial", 10, "bold"))
-        self.play_btn.pack(side=tk.LEFT)
+        speed_frame = tk.Frame(self)
+        speed_frame.pack(fill=tk.X, padx=8)
+        tk.Label(speed_frame, text="Speed (ms per frame):").pack(side=tk.LEFT)
+        self.speed_var = tk.IntVar(value=100)
+        self.speed_slider = tk.Scale(speed_frame, from_=10, to=500, orient=tk.HORIZONTAL, variable=self.speed_var)
+        self.speed_slider.pack(fill=tk.X, padx=6, expand=True)
 
-        # Learning curve display
-        curve_frame = tk.Frame(self)
-        curve_frame.pack(fill=tk.BOTH, padx=20, pady=10)
-        
-        tk.Label(curve_frame, text="Learning Curve:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.plot_label = tk.Label(curve_frame, text="Select a model and click 'Show Learning Curve'", 
-                                  bg="white", relief="sunken", height=10)
-        self.plot_label.pack(fill=tk.BOTH, expand=True, pady=5)
+        # Canvas for rendering
+        self.canvas = tk.Canvas(self, width=600, height=600, bg="black")
+        self.canvas.pack(padx=8, pady=8, side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Game display
-        game_frame = tk.Frame(self)
-        game_frame.pack(fill=tk.BOTH, padx=20, pady=(0, 20), expand=True)
-        
-        tk.Label(game_frame, text="Game Visualization:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.game_label = tk.Label(game_frame, text="Select a model and click 'Play Snake'", 
-                                  bg="black", fg="white", relief="sunken")
-        self.game_label.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        # Animation variables
-        self.frames = []
-        self.frame_idx = 0
-        self.animation_speed = 100  # milliseconds
+        # Info panel
+        info_frame = tk.Frame(self)
+        info_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
+        tk.Label(info_frame, text="Status").pack()
+        self.status_label = tk.Label(info_frame, text="No model loaded", anchor=tk.W, justify=tk.LEFT)
+        self.status_label.pack(fill=tk.X, pady=4)
+        tk.Label(info_frame, text="Model metadata").pack(pady=(10,0))
+        self.meta_text = tk.Text(info_frame, width=40, height=20, state=tk.DISABLED)
+        self.meta_text.pack()
 
     def refresh_models(self):
-        """Refresh the list of available models"""
-        if not os.path.exists(MODEL_DIR):
-            os.makedirs(MODEL_DIR)
-            self.model_combo['values'] = []
-            self.model_var.set("")
-            return
-        
-        model_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".pt")]
-        model_files.sort()
-        
-        self.model_combo['values'] = model_files
-        if model_files and not self.model_var.get():
-            self.model_var.set(model_files[0])
-        elif not model_files:
-            self.model_var.set("")
-
-    def show_learning_curve(self):
-        """Display the learning curve for the selected model"""
-        model_file = self.model_var.get()
-        if not model_file:
-            messagebox.showwarning("Warning", "Please select a model first.")
-            return
-        
-        # Look for corresponding PNG file
-        plot_file = model_file.replace(".pt", ".png")
-        plot_path = os.path.join(MODEL_DIR, plot_file)
-        
-        if os.path.exists(plot_path):
+        if not os.path.isdir(MODEL_DIR):
+            os.makedirs(MODEL_DIR, exist_ok=True)
+        files = sorted([f for f in os.listdir(MODEL_DIR) if f.endswith(".pt")])
+        self.model_combo['values'] = files
+        if files:
+            self.model_combo.current(0)
+        # show latest learning curve if present
+        curve_candidates = [f for f in os.listdir(MODEL_DIR) if f.startswith("learning_curve")]
+        if curve_candidates:
+            path = os.path.join(MODEL_DIR, curve_candidates[-1])
             try:
-                # Load and resize image
-                img = Image.open(plot_path)
-                # Resize to fit the display area
-                img = img.resize((750, 300), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                
-                self.plot_label.configure(image=photo, text='')
-                self.plot_label.image = photo  # Keep a reference
-                
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not load learning curve: {str(e)}")
-        else:
-            self.plot_label.configure(text=f"No learning curve found for {model_file}", image='')
-            self.plot_label.image = None
+                img = Image.open(path)
+                img = img.resize((300, 200), Image.LANCZOS)
+                self.curve_img = ImageTk.PhotoImage(img)
+                # place curve in meta area top
+                self.meta_text.config(state=tk.NORMAL)
+                self.meta_text.delete("1.0", tk.END)
+                self.meta_text.insert(tk.END, f"Found learning curve: {path}\n\n")
+                self.meta_text.config(state=tk.DISABLED)
+            except Exception:
+                pass
 
-    def play_snake(self):
-        """Load model and play Snake game"""
-        model_file = self.model_var.get()
-        if not model_file:
-            messagebox.showwarning("Warning", "Please select a model first.")
+    def load_selected_model(self):
+        sel = self.model_var.get()
+        if not sel:
+            messagebox.showinfo("No model", "Select a model file first.")
             return
-        
-        grid_size = int(self.grid_var.get())
-        model_path = os.path.join(MODEL_DIR, model_file)
-        
-        if not os.path.exists(model_path):
-            messagebox.showerror("Error", f"Model file not found: {model_file}")
-            return
-        
+        path = os.path.join(MODEL_DIR, sel)
         try:
-            # Load model
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            
-            if 'model_params' in checkpoint:
-                # New format with metadata
-                model_params = checkpoint['model_params']
-                model = SnakeQNet(model_params['seq_len'], model_params['feature_dim'], 
-                                 model_params['num_actions']).to(self.device)
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                # Try to infer from environment
-                env = gym.make("Snake-v0", render_mode=None, grid_size=grid_size)
-                seq_len, feature_dim = env.observation_space.shape
-                num_actions = env.action_space.n
-                env.close()
-                
-                model = SnakeQNet(seq_len, feature_dim, num_actions).to(self.device)
-                model.load_state_dict(checkpoint)
-            
-            model.eval()
-            
-            # Run game and collect frames
-            self.run_game_simulation(model, grid_size)
-            
+            ckpt = safe_torch_load(path, self.device)
+            if not isinstance(ckpt, dict) or 'model_state_dict' not in ckpt:
+                raise RuntimeError("Checkpoint missing 'model_state_dict'")
+            input_dim = int(ckpt.get('input_dim', 0))
+            num_actions = int(ckpt.get('num_actions', 0))
+            grid_size = int(ckpt.get('grid_size', DEFAULT_GRID))
+            if input_dim <= 0 or num_actions <= 0:
+                raise RuntimeError("Checkpoint missing valid input_dim or num_actions")
+            self.model = SnakeQNet(input_dim, num_actions).to(self.device)
+            self.model.load_state_dict(ckpt['model_state_dict'])
+            self.model.eval()
+            self.model_meta = {'input_dim': input_dim, 'num_actions': num_actions, 'grid_size': grid_size}
+            self.status_label.config(text=f"Loaded model: {sel}")
+            self._show_meta()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load or run model: {str(e)}")
+            messagebox.showerror("Load error", f"Failed to load model: {e}")
+            self.model = None
+            self.model_meta = None
+            self.status_label.config(text="Failed to load model")
 
-    def run_game_simulation(self, model, grid_size):
-        """Run the game simulation and collect frames"""
-        env = gym.make("Snake-v0", render_mode="rgb_array", grid_size=grid_size)
-        
-        state, _ = env.reset()
-        state = torch.tensor(state.astype(np.float32))
-        
-        self.frames = []
-        max_steps = 500
-        
-        for step in range(max_steps):
-            # Get action from model
-            with torch.no_grad():
-                q_values = model(state.unsqueeze(0).to(self.device))
-                action = torch.argmax(q_values).item()
-            
-            # Take step
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            state = torch.tensor(next_state.astype(np.float32))
-            
-            # Capture frame
-            frame = env.render()
-            if frame is not None:
-                # Resize frame for display
-                img = Image.fromarray(frame)
-                # Calculate size to fit display area while maintaining aspect ratio
-                img = img.resize((400, 400), Image.Resampling.NEAREST)
-                self.frames.append(ImageTk.PhotoImage(img))
-            
-            if terminated or truncated:
-                break
-        
-        env.close()
-        
-        if not self.frames:
-            self.game_label.config(text="No frames generated", image='')
+    def _show_meta(self):
+        self.meta_text.config(state=tk.NORMAL)
+        self.meta_text.delete("1.0", tk.END)
+        for k, v in (self.model_meta or {}).items():
+            self.meta_text.insert(tk.END, f"{k}: {v}\n")
+        self.meta_text.config(state=tk.DISABLED)
+
+    def _make_env(self):
+        grid_size = int(self.model_meta.get('grid_size', DEFAULT_GRID)) if self.model_meta else DEFAULT_GRID
+        try:
+            env = gym.make("Snake-v0", render_mode="rgb_array", grid_size=grid_size)
+            return env
+        except Exception as e:
+            messagebox.showerror("Env error", f"Failed to create env: {e}")
+            return None
+
+    def start_run(self):
+        if self.model is None:
+            messagebox.showinfo("No model", "Load a model first.")
             return
-        
-        # Start animation
-        self.frame_idx = 0
-        self.game_label.config(text='')
-        self.animate_frames()
-
-    def animate_frames(self):
-        """Animate the collected frames"""
-        if not self.frames or self.frame_idx >= len(self.frames):
-            # Animation finished, show completion message
-            self.game_label.config(text="Game completed! Click 'Play Snake' to run again.")
+        if self.playing:
             return
-        
-        # Show current frame
-        frame = self.frames[self.frame_idx]
-        self.game_label.config(image=frame)
-        self.game_label.image = frame  # Keep reference
-        
-        self.frame_idx += 1
-        
-        # Schedule next frame
-        self.after(self.animation_speed, self.animate_frames)
+        # create env for rendering
+        self.env = self._make_env()
+        if self.env is None:
+            return
+        self.playing = True
+        self.play_thread = threading.Thread(target=self._play_loop, daemon=True)
+        self.play_thread.start()
+        self.status_label.config(text="Playing...")
 
+    def pause_run(self):
+        self.playing = False
+        self.status_label.config(text="Paused")
 
-def main():
-    """Main function"""
-    # Check if models directory exists, create if not
-    if not os.path.exists(MODEL_DIR):
-        os.makedirs(MODEL_DIR)
-        print(f"Created {MODEL_DIR} directory")
-    
-    # Check for trained models
-    model_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".pt")]
-    if not model_files:
-        print("No trained models found!")
-        print(f"Train a model first by running: python main.py")
-        print(f"Models will be saved to: {MODEL_DIR}")
-    
-    # Start the application
-    app = SnakeApp()
-    print("🐍 Snake AI Model Selector started")
-    print(f"Device: {app.device}")
-    app.mainloop()
+    def step_once(self):
+        if self.model is None:
+            messagebox.showinfo("No model", "Load a model first.")
+            return
+        if self.env is None:
+            self.env = self._make_env()
+            if self.env is None:
+                return
+            self.obs, _ = self.env.reset()
+        # single deterministic step
+        feat = obs_to_features_for_gui(self.obs, self.env.unwrapped.grid_size if hasattr(self.env.unwrapped, 'grid_size') else int(self.grid_var.get()))
+        with torch.no_grad():
+            q = self.model(torch.from_numpy(feat).float().to(self.device))
+            act = int(torch.argmax(q, dim=1).item())
+        self.obs, r, term, trunc, _ = self.env.step(act)
+        frame = self.env.render()
+        self._display_frame(frame)
+        self.status_label.config(text=f"Step reward: {r:.2f} done:{term or trunc}")
+        if term or trunc:
+            try:
+                self.env.close()
+            except Exception:
+                pass
+            self.env = None
+
+    def _play_loop(self):
+        try:
+            self.obs, _ = self.env.reset()
+            max_steps = 1000
+            for _ in range(max_steps):
+                if not self.playing:
+                    break
+                feat = obs_to_features_for_gui(self.obs, self.env.unwrapped.grid_size if hasattr(self.env.unwrapped, 'grid_size') else int(self.model_meta.get('grid_size', DEFAULT_GRID)))
+                with torch.no_grad():
+                    q = self.model(torch.from_numpy(feat).float().to(self.device))
+                    act = int(torch.argmax(q, dim=1).item())
+                self.obs, r, term, trunc, info = self.env.step(act)
+                frame = self.env.render()
+                # update UI on main thread
+                self.after(0, self._display_frame, frame)
+                self.after(0, self.status_label.config, {"text": f"Reward: {r:.2f} Score: {info.get('score', '')}"})
+                if term or trunc:
+                    break
+                # sleep according to speed slider
+                time.sleep(self.speed_var.get() / 1000.0)
+        except Exception as e:
+            self.after(0, messagebox.showerror, "Runtime error", f"Error during play: {e}")
+        finally:
+            self.playing = False
+            try:
+                if self.env is not None:
+                    self.env.close()
+            except Exception:
+                pass
+            self.env = None
+            self.after(0, self.status_label.config, {"text": "Stopped"})
+
+    def _display_frame(self, frame):
+        if frame is None:
+            return
+        # frame is HxWx3 numpy array
+        try:
+            img = Image.fromarray(frame.astype('uint8'))
+            # fit canvas size while preserving aspect
+            canvas_w = self.canvas.winfo_width() or 600
+            canvas_h = self.canvas.winfo_height() or 600
+            img = img.resize((canvas_w, canvas_h), Image.NEAREST)
+            self.frame_image = ImageTk.PhotoImage(img)
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.frame_image)
+        except Exception as e:
+            # fallback: ignore display errors
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    app = SnakeViewerApp()
+    app.mainloop()
