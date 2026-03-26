@@ -1,108 +1,129 @@
-# Snake Deep Q-Learning Agent - Simplified
+# Snake Deep Q-Learning Agent
 
-A clean, simplified implementation of a Snake game environment using Gymnasium and deep Q-learning agent trained with PyTorch. This refactored version includes only the essential components for training and running Snake AI models.
+A Python implementation of a Snake environment using Gymnasium and a deep Q-learning agent with PyTorch. This repo offers flexible training, a GUI for testing, and both detailed technical settings and practical quick-start instructions.
+
+---
 
 ## Quick Start
 
-### Training a Model
+1. **Create a virtual environment & install dependencies:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install -r requirements
+   ```
+2. **Train a new model (optional):**
+   ```bash
+   python main.py
+   ```
+   - Models are saved in `saved_models/`, along with training curves.
+3. **Or use the GUI application with the included pretrained model:**
+   ```bash
+   python app.py
+   ```
+   - Select your model file and grid size to watch the AI play!
 
-Run the training script to train a new Snake AI model:
+---
 
-```bash
-python main.py
+## Technical Details
+
+### Environment (`snake_gym_env.py`)
+- **Action space:** 4 discrete (0=right, 1=up, 2=left, 3=down)
+- **Observation space:**  
+  - `coords`: Body positions (head, rest padded with (-1,-1)), and fruit coordinates
+  - `features`:  
+    - Head x/y (normalized)
+    - Fruit relative x/y (normalized)
+    - Heading (x, y direction)
+    - Danger ahead, left, right (1 if collision, else 0)
+- **Reward function:**
+  - +1 on eating fruit
+  - -1 on collision (terminal)
+  - +0.05 for getting closer to fruit
+  - -0.05 for getting farther from fruit
+  - -0.001 per time step
+- **Fruit is never spawned on the snake's body.**
+
+
+### Sample Feature Extraction Code
+```python
+def _coords_to_features(self, coords: np.ndarray) -> np.ndarray:
+    # ...details...
+    return np.array([
+        head[0] / denom,
+        head[1] / denom,
+        dx / denom,
+        dy / denom,
+        hx, hy,
+        danger(*front),
+        danger(*left),
+        danger(*right)
+    ], dtype=np.float32)
+```
+- Where `danger` returns 1.0 if moving to the tested position would cause a collision.
+
+---
+
+## Training (main.py)
+
+- **Optimizer:** `Adam` (default lr=1e-4)
+- **Loss:** `SmoothL1Loss`
+- **Replay buffer:** size 50,000
+- **Discount factor:** γ = 0.99
+- **Batch size:** 256
+- **Target network update:** every 1000 steps
+- **Epsilon-greedy schedule:**  
+  - eps_start = 1, eps_end = 0.05, eps_decay_steps = 200,000
+
+- **Supports multi-environment training:**  
+  Default n_envs=8 in parallel (vectorized).
+
+---
+
+## Example Training Call
+
+```python
+train_model(
+    grid_size=20,
+    episodes=2000,
+    learning_rate=1e-4,
+    batch_size=256,
+    seed=42,
+    n_envs=8,
+    save_dir="saved_models"
+)
 ```
 
-This will train a model and save it to the `saved_models/` directory along with a learning curve plot.
+---
 
-### Testing a Trained Model
+## File Structure
 
-Launch the GUI application to select and test trained models:
+- `main.py` — Training loop, model, evaluation
+- `app.py` — GUI to visualize or manually play
+- `snake_gym_env.py` — Gymnasium environment (core rules & obs)
+- `saved_models/` — Pretrained and user-trained weights (e.g., `best_snake_grid20.pt`)
+- `Graphics/`, `Sound/`, `Font/` — Art assets
 
-```bash
-python app.py
-```
+---
 
-Select a model file and grid size, then watch the AI play Snake!
-
-## Core Files
-
-- `main.py` : Complete training script with model architecture and training loop
-- `app.py` : GUI application for selecting models and visualizing gameplay  
-- `snake_gym_env.py` : Custom Snake environment implementation for Gymnasium
-- `Graphics/` : Image assets for the snake and fruit visualization
-- `Sound/` : Sound effects (crunch.wav)
-- `Font/` : Font file for score display
 ## Requirements
 
 - Python 3.8+
 - PyTorch >= 1.12.0
 - Gymnasium == 1.2.0
 - Pygame == 2.6.1
-- NumPy
-- Matplotlib
-- Pillow
+- NumPy, Matplotlib, Pillow
 
-You can install all dependencies via pip:
-
-```bash
-pip install -r requirements
-```
-
-## Model Configuration
-
-The simplified training script uses a single MLP model architecture:
-
-### Model Architecture
-- Input: Flattened snake position coordinates and fruit position
-- Hidden layers: 128 → 64 neurons with ReLU activation
-- Output: Q-values for 4 actions (up, down, left, right)
-- Parameters: ~111K (efficient and fast to train)
-
-### Training Parameters (configurable in main.py)
-- Grid Size: 20x20 (default)
-- Episodes: 1000 (default)
-- Learning Rate: 0.001
-- Batch Size: 256
-- Replay Buffer: 50,000 transitions
-
-## Environment Details
-
-### Observation Space
-- Snake body coordinates: (max_length + 1) × 2 array
-- Each coordinate pair represents (x, y) position
-- Padded with (-1, -1) for positions beyond current snake length
-- Last coordinate pair is the fruit position
-
-### Action Space
-- 0: Move right
-- 1: Move up  
-- 2: Move left
-- 3: Move down
-
-### Rewards
-- +10 for eating fruit
-- -10 for collision (game over)
-- +0.5 for moving closer to fruit
-- -0.1 for moving away from fruit
-- -0.005 per time step (encourages efficiency)
-
-## Environment Registration
-
-The environment is automatically registered as `Snake-v0` when importing `snake_gym_env`:
-
-```python
-import snake_gym_env
-import gymnasium as gym
-
-env = gym.make("Snake-v0", render_mode="human", grid_size=20)
-```
+---
 
 ## Troubleshooting
 
-- If you get import errors, make sure all dependencies are installed
-- For GUI issues on Linux, install tkinter: `sudo apt-get install python3-tk`
-- Models are saved in `saved_models/` directory - make sure it has write permissions
+- All errors usually result from missing dependencies or missing asset files.
+- On Linux, for GUI, install Tkinter:  
+  `sudo apt-get install python3-tk`
+
+---
 
 ## License
 
-This project is provided for educational and research purposes.
+Provided for educational and research purposes.
