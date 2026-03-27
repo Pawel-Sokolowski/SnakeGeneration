@@ -58,10 +58,10 @@ class SnakeEnv(gym.Env):
         self.terminated = False
         self.truncated = False
         self.score = 0
+        self.steps = 0
+        self.max_steps = self.grid_size * self.grid_size * 10  # safety cap
 
-    # -------------------------
-    # Seeding & reset
-    # -------------------------
+
     def seed(self, seed: Optional[int] = None):
         self._rng = random.Random(seed)
 
@@ -82,15 +82,15 @@ class SnakeEnv(gym.Env):
         self.terminated = False
         self.truncated = False
         self.score = 0
+        self.steps = 0
 
         return self._get_obs(), {}
 
-    # -------------------------
-    # Step with shaping
-    # -------------------------
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict]:
         if self.terminated or self.truncated:
             return self._get_obs(), 0.0, True, False, {}
+
+        self.steps += 1
 
         # Map action to direction
         action_map = [
@@ -108,46 +108,55 @@ class SnakeEnv(gym.Env):
         head = self.snake[0]
         new_head = head + self.direction
 
-        # Collision check
-        if self._collision(new_head):
-            self.terminated = True
-            return self._get_obs(), -1.0, True, False, {"collision": True}
-
-        # Distance to fruit before and after move
+        # Distance to fruit before and after move (Manhattan)
         fruit = self.fruit
         prev_dist = abs(head.x - fruit.x) + abs(head.y - fruit.y)
         new_dist = abs(new_head.x - fruit.x) + abs(new_head.y - fruit.y)
 
+        # Base reward
+        reward = 0.0
+
+        # Collision check
+        if self._collision(new_head):
+            self.terminated = True
+            reward -= 1.0  # strong penalty for dying
+            return self._get_obs(), float(reward), True, False, {"collision": True, "score": self.score}
+
         # Move snake
         self.snake.insert(0, new_head)
-
-        reward = 0.0
 
         # Fruit eaten
         if new_head == self.fruit:
             self.score += 1
-            reward += 1.0
+            reward += 1.0  # main positive reward
             self._randomize_fruit()
         else:
             self.snake.pop()
 
-        # Distance shaping
         if new_dist < prev_dist:
-            reward += 0.05
+            reward += 0.2
         elif new_dist > prev_dist:
-            reward -= 0.05
+            reward -= 0.2
 
-        # Tiny time penalty
+        move_vec = np.array([self.direction.x, self.direction.y], dtype=np.float32)
+        fruit_vec = np.array([fruit.x - new_head.x, fruit.y - new_head.y], dtype=np.float32)
+        fruit_norm = np.linalg.norm(fruit_vec)
+        if fruit_norm > 0:
+            fruit_dir = fruit_vec / fruit_norm
+            alignment = float(np.dot(move_vec, fruit_dir))  # in [-1, 1]
+            reward += 0.05 * alignment
+
+        #survival
+        reward += 0.01
+        #circling
         reward -= 0.001
 
-        if len(self.snake) >= self.max_snake_length:
+        # Truncation if snake fills board or too many steps
+        if len(self.snake) >= self.max_snake_length or self.steps >= self.max_steps:
             self.truncated = True
 
         return self._get_obs(), float(reward), self.terminated, self.truncated, {"score": self.score}
 
-    # -------------------------
-    # Collision & fruit
-    # -------------------------
     def _collision(self, pos: Vector2) -> bool:
         # wall
         if not (0 <= pos.x < self.grid_size and 0 <= pos.y < self.grid_size):
@@ -168,9 +177,6 @@ class SnakeEnv(gym.Env):
         fx, fy = self._rng.choice(list(free))
         self.fruit = Vector2(fx, fy)
 
-    # -------------------------
-    # Observations
-    # -------------------------
     def _get_obs(self) -> Dict[str, np.ndarray]:
         # coords
         body_coords = [(int(b.x), int(b.y)) for b in self.snake]
@@ -230,9 +236,6 @@ class SnakeEnv(gym.Env):
             danger(*right)
         ], dtype=np.float32)
 
-    # -------------------------
-    # Rendering
-    # -------------------------
     def _init_pygame(self):
         if self.render_mode is None or self._pygame_initialized:
             return
