@@ -1,7 +1,5 @@
 import os
 import time
-import json
-import csv
 import random
 from collections import deque
 from typing import List, Optional
@@ -15,15 +13,12 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-import snake_gym_env  # ensures Snake-v0 is registered
+import snake_gym_env
 
 SAVED_DIR = "saved_models"
 os.makedirs(SAVED_DIR, exist_ok=True)
 
 
-# -------------------------
-# Device selection
-# -------------------------
 def get_device():
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -36,27 +31,21 @@ def get_device():
     return device
 
 
-# -------------------------
-# Q-Network
-# -------------------------
 class SnakeQNet(nn.Module):
     def __init__(self, input_dim: int, num_actions: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(32, num_actions),
+            nn.Linear(128, num_actions),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-# -------------------------
-# Replay Buffer
-# -------------------------
 class ReplayBuffer:
     def __init__(self, max_length: int = 50_000):
         self.states = deque(maxlen=max_length)
@@ -87,9 +76,6 @@ class ReplayBuffer:
         return len(self.dones)
 
 
-# -------------------------
-# Double DQN training step
-# -------------------------
 def train_step_double_dqn(
     buffer: ReplayBuffer,
     model: nn.Module,
@@ -131,16 +117,21 @@ def train_step_double_dqn(
     return float(loss.item())
 
 
-# -------------------------
-# Vectorized training loop
-# -------------------------
+def obs_to_features(obs: dict) -> np.ndarray:
+    coords = obs["coords"].astype(np.float32)
+    feats = obs["features"].astype(np.float32)
+    n_envs = coords.shape[0]
+    coords_flat = coords.reshape(n_envs, -1)
+    return np.concatenate([coords_flat, feats], axis=1)
+
+
 def train_model(
     grid_size=20,
-    episodes=2000,          # total episodes across all envs
+    episodes=2000,
     learning_rate=1e-4,
     batch_size=256,
     seed: Optional[int] = 42,
-    eval_every=2000,        # in completed episodes
+    eval_every=2000,
     n_envs: int = 8,
     save_dir=SAVED_DIR,
 ):
@@ -151,14 +142,13 @@ def train_model(
 
     device = get_device()
 
-    # Vectorized env: n_envs parallel Snake-v0 instances
     def make_env():
         return gym.make("Snake-v0", render_mode=None, grid_size=grid_size)
 
     env = SyncVectorEnv([make_env for _ in range(n_envs)])
 
     obs, _ = env.reset()
-    feat = np.asarray(obs["features"], dtype=np.float32)  # (n_envs, feat_dim)
+    feat = obs_to_features(obs)
     input_dim = feat.shape[1]
     num_actions = env.single_action_space.n
 
@@ -171,7 +161,7 @@ def train_model(
     buffer = ReplayBuffer(max_length=50_000)
 
     gamma = 0.99
-    max_steps = 500
+    max_steps = 4000
 
     eps_start = 1.0
     eps_end = 0.05
@@ -190,14 +180,13 @@ def train_model(
     pbar = tqdm(total=episodes, desc="Episodes (across envs)")
 
     while completed_episodes < episodes:
-        state_feats = np.asarray(obs["features"], dtype=np.float32)  # (n_envs, feat_dim)
+        state_feats = obs_to_features(obs)
 
         epsilon = max(eps_end, eps_start - training_steps / eps_decay_steps)
 
-        # batch action selection
         with torch.no_grad():
             state_tensor = torch.from_numpy(state_feats).float().to(device)
-            q_values = model(state_tensor)  # (n_envs, num_actions)
+            q_values = model(state_tensor)
             greedy_actions = q_values.argmax(dim=1).cpu().numpy()
 
         random_mask = np.random.rand(n_envs) < epsilon
@@ -206,9 +195,8 @@ def train_model(
 
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
         dones = np.logical_or(terminations, truncations)
-        next_feats = np.asarray(next_obs["features"], dtype=np.float32)
+        next_feats = obs_to_features(next_obs)
 
-        # store transitions
         for i in range(n_envs):
             buffer.store(
                 state_feats[i],
@@ -221,7 +209,6 @@ def train_model(
         per_env_returns += rewards.astype(np.float32)
         training_steps += n_envs
 
-        # training step
         if len(buffer) >= batch_size and training_steps > warmup_steps:
             loss_val = train_step_double_dqn(
                 buffer,
@@ -236,7 +223,6 @@ def train_model(
             if training_steps % target_update_freq == 0:
                 target_model.load_state_dict(model.state_dict())
 
-        # handle episode endings
         if np.any(dones):
             for i in range(n_envs):
                 if dones[i]:
@@ -254,13 +240,17 @@ def train_model(
 
         obs = next_obs
 
-        # evaluation
         if completed_episodes > 0 and completed_episodes % eval_every == 0:
             eval_rewards = []
             eval_env = gym.make("Snake-v0", render_mode=None, grid_size=grid_size)
             for _ in range(3):
                 o, _ = eval_env.reset()
-                feat_eval = np.asarray(o["features"], dtype=np.float32)
+                feat_eval = obs_to_features(
+                    {
+                        "coords": o["coords"][None, ...],
+                        "features": o["features"][None, ...],
+                    }
+                )[0]
                 total_r = 0.0
                 for _ in range(max_steps):
                     with torch.no_grad():
@@ -273,7 +263,12 @@ def train_model(
                         act = int(torch.argmax(qvals, dim=1).item())
                     o2, r_eval, term_eval, trunc_eval, _ = eval_env.step(act)
                     total_r += float(r_eval)
-                    feat_eval = np.asarray(o2["features"], dtype=np.float32)
+                    feat_eval = obs_to_features(
+                        {
+                            "coords": o2["coords"][None, ...],
+                            "features": o2["features"][None, ...],
+                        }
+                    )[0]
                     if term_eval or trunc_eval:
                         break
                 eval_rewards.append(total_r)
@@ -315,10 +310,10 @@ def train_model(
 if __name__ == "__main__":
     train_model(
         grid_size=20,
-        episodes=200000,   # total episodes across all envs
+        episodes=200_000,
         learning_rate=1e-4,
         batch_size=256,
         seed=42,
         eval_every=2000,
-        n_envs=8,          # you can lower this if the container is tight on CPU
+        n_envs=8,
     )
