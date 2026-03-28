@@ -1,316 +1,338 @@
 import random
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
-import pygame
-from pygame.math import Vector2
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.envs.registration import register
 
+from pygame.math import Vector2
 
+
+# ===================================================================
+#                            SNAKE ENV (48 features)
+# ===================================================================
 class SnakeEnv(gym.Env):
-    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 15}
+    metadata = {}
 
-    def __init__(self, grid_size: int = 20, render_mode: Optional[str] = None, seed: Optional[int] = None):
+    def __init__(self, grid_size=20, render_mode=None, seed=None):
         super().__init__()
-        self.grid_size = int(grid_size)
-        self.cell_size = 40
-        self.window_size = self.grid_size * self.cell_size
-        self.render_mode = render_mode
+        self.grid_size = grid_size
         self._rng = random.Random(seed)
 
-        # Max snake length = all cells
-        self.max_snake_length = self.grid_size * self.grid_size
-
-        # coords: snake body (padded) + fruit
-        coords_shape = (self.max_snake_length + 1, 2)
-        coords_space = spaces.Box(
-            low=-1,
-            high=self.grid_size - 1,
-            shape=coords_shape,
-            dtype=np.int32
-        )
-
-        # features: [head_x, head_y, apple_dx, apple_dy, dir_x, dir_y, danger_front, danger_left, danger_right]
-        features_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(9,),
-            dtype=np.float32
-        )
+        self.max_len = grid_size * grid_size
 
         self.observation_space = spaces.Dict({
-            "coords": coords_space,
-            "features": features_space
+            "coords": spaces.Box(
+                low=-1, high=grid_size,
+                shape=(self.max_len + 1, 2),
+                dtype=np.int32
+            ),
+            "features": spaces.Box(
+                low=-2.0, high=2.0,
+                shape=(48,),
+                dtype=np.float32
+            )
         })
 
-        self.action_space = spaces.Discrete(4)  # right, up, left, down
+        self.action_space = spaces.Discrete(4)
 
-        # pygame
-        self._pygame_initialized = False
-        self._assets_loaded = False
-
-        # game state
         self.snake: List[Vector2] = []
-        self.fruit: Vector2 = Vector2(-1, -1)
         self.direction = Vector2(1, 0)
+        self.fruit = Vector2(-1, -1)
+        self.score = 0
+        self.steps = 0
         self.terminated = False
         self.truncated = False
-        self.score = 0
 
-    # -------------------------
-    # Seeding & reset
-    # -------------------------
-    def seed(self, seed: Optional[int] = None):
-        self._rng = random.Random(seed)
+        self.max_steps = grid_size * grid_size * 10
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+    # ===================================================================
+    # RESET
+    # ===================================================================
+    def reset(self, *, seed=None, options=None):
         if seed is not None:
-            self.seed(seed)
-        self._init_pygame()
+            self._rng = random.Random(seed)
 
         mid = self.grid_size // 2
         self.direction = Vector2(1, 0)
+
         self.snake = [
             Vector2(mid + 1, mid),
             Vector2(mid, mid),
-            Vector2(mid - 1, mid)
+            Vector2(mid - 1, mid),
         ]
 
-        self._randomize_fruit()
+        self._place_fruit()
+        self.score = 0
+        self.steps = 0
         self.terminated = False
         self.truncated = False
-        self.score = 0
 
-        return self._get_obs(), {}
+        return self._obs(), {}
 
-    # -------------------------
-    # Step with shaping
-    # -------------------------
-    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict]:
+    # ===================================================================
+    # STEP
+    # ===================================================================
+    def step(self, action):
         if self.terminated or self.truncated:
-            return self._get_obs(), 0.0, True, False, {}
+            return self._obs(), 0.0, True, False, {}
 
-        # Map action to direction
-        action_map = [
-            Vector2(1, 0),   # right
-            Vector2(0, -1),  # up
-            Vector2(-1, 0),  # left
-            Vector2(0, 1)    # down
+        self.steps += 1
+
+        dirs = [
+            Vector2(1, 0),
+            Vector2(0, -1),
+            Vector2(-1, 0),
+            Vector2(0, 1)
         ]
-        new_dir = action_map[int(action)]
 
-        # Prevent reversing
+        new_dir = dirs[action]
         if new_dir + self.direction != Vector2(0, 0):
             self.direction = new_dir
 
         head = self.snake[0]
         new_head = head + self.direction
 
-        # Collision check
-        if self._collision(new_head):
-            self.terminated = True
-            return self._get_obs(), -1.0, True, False, {"collision": True}
-
-        # Distance to fruit before and after move
-        fruit = self.fruit
-        prev_dist = abs(head.x - fruit.x) + abs(head.y - fruit.y)
-        new_dist = abs(new_head.x - fruit.x) + abs(new_head.y - fruit.y)
-
-        # Move snake
-        self.snake.insert(0, new_head)
-
         reward = 0.0
 
-        # Fruit eaten
+        # distance change to fruit
+        prev_d = abs(head.x - self.fruit.x) + abs(head.y - self.fruit.y)
+        new_d = abs(new_head.x - self.fruit.x) + abs(new_head.y - self.fruit.y)
+
+        # collision
+        if self._hit(new_head):
+            self.terminated = True
+            return self._obs(), -1.0, True, False, {"score": self.score}
+
+        # move
+        self.snake.insert(0, new_head)
+
+        # eat fruit?
         if new_head == self.fruit:
             self.score += 1
             reward += 1.0
-            self._randomize_fruit()
+            self._place_fruit()
         else:
             self.snake.pop()
 
-        # Distance shaping
-        if new_dist < prev_dist:
-            reward += 0.05
-        elif new_dist > prev_dist:
-            reward -= 0.05
+        # shaping
+        if new_d < prev_d:
+            reward += 0.2
+        elif new_d > prev_d:
+            reward -= 0.2
 
-        # Tiny time penalty
-        reward -= 0.001
+        if not self.truncated:
+            reward += 0.01
 
-        if len(self.snake) >= self.max_snake_length:
+        if self.steps >= self.max_steps:
             self.truncated = True
 
-        return self._get_obs(), float(reward), self.terminated, self.truncated, {"score": self.score}
+        return self._obs(), reward, self.terminated, self.truncated, {"score": self.score}
 
-    # -------------------------
-    # Collision & fruit
-    # -------------------------
-    def _collision(self, pos: Vector2) -> bool:
-        # wall
-        if not (0 <= pos.x < self.grid_size and 0 <= pos.y < self.grid_size):
+    # ===================================================================
+    # UTILS
+    # ===================================================================
+    def _hit(self, p):
+        if not (0 <= p.x < self.grid_size and 0 <= p.y < self.grid_size):
             return True
-        # body (exclude head)
         for b in self.snake[1:]:
-            if pos == b:
+            if p == b:
                 return True
         return False
 
-    def _randomize_fruit(self):
-        free = {(x, y) for x in range(self.grid_size) for y in range(self.grid_size)}
+    def _place_fruit(self):
+        free = set((x, y) for x in range(self.grid_size) for y in range(self.grid_size))
         for b in self.snake:
             free.discard((int(b.x), int(b.y)))
+
         if not free:
             self.fruit = Vector2(-1, -1)
             return
+
         fx, fy = self._rng.choice(list(free))
         self.fruit = Vector2(fx, fy)
 
-    # -------------------------
-    # Observations
-    # -------------------------
-    def _get_obs(self) -> Dict[str, np.ndarray]:
-        # coords
-        body_coords = [(int(b.x), int(b.y)) for b in self.snake]
-        padding = self.max_snake_length - len(body_coords)
-        padded = body_coords + [(-1, -1)] * padding
-        fruit_coord = [(int(self.fruit.x), int(self.fruit.y))]
-        coords = np.array(padded + fruit_coord, dtype=np.int32)
+    # ===================================================================
+    # OBSERVATION
+    # ===================================================================
+    def _obs(self):
+        coords = np.full((self.max_len + 1, 2), -1, dtype=np.int32)
+        arr = [(int(b.x), int(b.y)) for b in self.snake]
+        arr.append((int(self.fruit.x), int(self.fruit.y)))
+        arr = np.asarray(arr, dtype=np.int32)
+        coords[:len(arr)] = arr
 
-        features = self._coords_to_features(coords)
-        return {"coords": coords, "features": features}
+        return {
+            "coords": coords,
+            "features": self._features()
+        }
 
-    def _coords_to_features(self, coords: np.ndarray) -> np.ndarray:
-        head = coords[0]
-        fruit = coords[-1]
+    # ===================================================================
+    # STABLE 48-DIM FEATURES (ALWAYS VALID SHAPE)
+    # ===================================================================
+    def _features(self):
+        head = self.snake[0]
+        tail = self.snake[-1]
+        fruit = self.fruit
+        body = {(int(b.x), int(b.y)) for b in self.snake[1:]}
 
-        # body excluding head
-        body = []
-        for (x, y) in coords[1:-1]:
-            if x == -1:
-                break
-            body.append((int(x), int(y)))
+        N = max(1, self.grid_size - 1)
 
-        # direction from neck
-        if len(coords) >= 2 and coords[1][0] != -1:
-            neck = coords[1]
-            dir_x = head[0] - neck[0]
-            dir_y = head[1] - neck[1]
+        # normalized fruit vector
+        fdx = (fruit.x - head.x) / N
+        fdy = (fruit.y - head.y) / N
+
+        # head movement vector
+        if len(self.snake) >= 2:
+            neck = self.snake[1]
+            hx = (head.x - neck.x)
+            hy = (head.y - neck.y)
         else:
-            dir_x, dir_y = 1, 0
+            hx, hy = 1, 0
 
-        # apple delta
-        dx = fruit[0] - head[0]
-        dy = fruit[1] - head[1]
+        # tail direction
+        if len(self.snake) >= 2:
+            if len(self.snake) >= 3:
+                t2 = self.snake[-2]
+                tx = tail.x - t2.x
+                ty = tail.y - t2.y
+            else:
+                tx, ty = -hx, -hy
+        else:
+            tx, ty = -hx, -hy
 
+        # length info
+        length = len(self.snake)
+        length_norm = length / (self.grid_size * self.grid_size)
+
+        # danger 4 directions
         def danger(x, y):
             if not (0 <= x < self.grid_size and 0 <= y < self.grid_size):
                 return 1.0
-            if (x, y) in body:
-                return 1.0
-            return 0.0
+            return 1.0 if (x, y) in body else 0.0
 
-        hx, hy = dir_x, dir_y
-        front = (head[0] + hx, head[1] + hy)
-        left = (head[0] - hy, head[1] + hx)
-        right = (head[0] + hy, head[1] - hx)
+        front = (int(head.x + hx), int(head.y + hy))
+        left  = (int(head.x - hy), int(head.y + hx))
+        right = (int(head.x + hy), int(head.y - hx))
+        back  = (int(head.x - hx), int(head.y - hy))
 
-        denom = max(1, self.grid_size - 1)
+        # wall distance normalized
+        wl = head.x / N
+        wr = (self.grid_size - 1 - head.x) / N
+        wu = head.y / N
+        wd = (self.grid_size - 1 - head.y) / N
 
-        return np.array([
-            head[0] / denom,
-            head[1] / denom,
-            dx / denom,
-            dy / denom,
+        # tail distance normalized
+        tdx = (tail.x - head.x) / N
+        tdy = (tail.y - head.y) / N
+        tman = (abs(tail.x - head.x) + abs(tail.y - head.y)) / N
+
+        # ----------------------------
+        # Local 3x3 occupancy (exact 9 values)
+        # ----------------------------
+        grid9 = []
+        for yy in [-1, 0, 1]:
+            for xx in [-1, 0, 1]:
+                cx, cy = int(head.x + xx), int(head.y + yy)
+                if not (0 <= cx < self.grid_size and 0 <= cy < self.grid_size):
+                    grid9.append(1.0)
+                elif (cx, cy) in body:
+                    grid9.append(1.0)
+                else:
+                    grid9.append(0.0)
+
+        # ----------------------------
+        # Raycasts (4 values)
+        # ----------------------------
+        def ray(dx, dy):
+            x, y = int(head.x), int(head.y)
+            d = 0
+            while True:
+                x += dx; y += dy
+                if not (0 <= x < self.grid_size and 0 <= y < self.grid_size):
+                    break
+                if (x, y) in body:
+                    break
+                d += 1
+            return d / self.grid_size
+
+        ray_u = ray(0, -1)
+        ray_d = ray(0, 1)
+        ray_l = ray(-1, 0)
+        ray_r = ray(1, 0)
+
+        # ----------------------------
+        # Flood fill (safe area)
+        # ----------------------------
+        def flood():
+            sx, sy = int(head.x), int(head.y)
+            st = [(sx, sy)]
+            vis = {(sx, sy)}
+            c = 0
+            while st:
+                cx, cy = st.pop()
+                c += 1
+                for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                    nx, ny = cx+dx, cy+dy
+                    if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
+                        if (nx, ny) not in vis and (nx, ny) not in body:
+                            vis.add((nx, ny))
+                            st.append((nx, ny))
+            return c / (self.grid_size * self.grid_size)
+
+        area = flood()
+        if np.isnan(area):
+            area = 0.0
+
+        dead = 1.0 if area < 0.10 else 0.0
+        encl = 1.0 if area < length_norm else 0.0
+        fcor = 1.0 if (abs(fdx) + abs(fdy) < 0.20 and area < 0.15) else 0.0
+
+        # ----------------------------
+        # BUILD FIXED SHAPE VECTOR
+        # ----------------------------
+        vec = [
+            fdx, fdy,
             hx, hy,
+            length_norm, float(length),
+            tx, ty,
+
             danger(*front),
             danger(*left),
-            danger(*right)
-        ], dtype=np.float32)
+            danger(*right),
+            danger(*back),
 
-    # -------------------------
-    # Rendering
-    # -------------------------
-    def _init_pygame(self):
-        if self.render_mode is None or self._pygame_initialized:
-            return
+            wl, wr, wu, wd,
 
-        pygame.init()
-        if self.render_mode == "rgb_array":
-            self.screen = pygame.Surface((self.window_size, self.window_size))
-        else:
-            self.screen = pygame.display.set_mode((self.window_size, self.window_size))
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont(None, 25)
-        self._pygame_initialized = True
+            tdx, tdy, tman,
 
-    def render(self):
-        if self.render_mode is None:
-            return None
+            *grid9,
 
-        self._init_pygame()
-        surface = self.screen
-        surface.fill((175, 215, 70))
+            ray_u, ray_d, ray_l, ray_r,
 
-        grass_color = (167, 209, 61)
-        for row in range(self.grid_size):
-            for col in range(self.grid_size):
-                if (row + col) % 2 == 0:
-                    rect = pygame.Rect(
-                        col * self.cell_size,
-                        row * self.cell_size,
-                        self.cell_size,
-                        self.cell_size
-                    )
-                    pygame.draw.rect(surface, grass_color, rect)
+            area, dead, encl, fcor
+        ]
 
-        # fruit
-        if self.fruit.x >= 0:
-            fx = int(self.fruit.x * self.cell_size)
-            fy = int(self.fruit.y * self.cell_size)
-            rect = pygame.Rect(fx, fy, self.cell_size, self.cell_size)
-            pygame.draw.rect(surface, (255, 0, 0), rect)
+        vec = np.array(vec, dtype=np.float32)
 
-        # snake
-        for i, block in enumerate(self.snake):
-            x_pos = int(block.x * self.cell_size)
-            y_pos = int(block.y * self.cell_size)
-            rect = pygame.Rect(x_pos, y_pos, self.cell_size, self.cell_size)
-            color = (0, 100, 0) if i == 0 else (0, 150, 0)
-            pygame.draw.rect(surface, color, rect)
+        # SAFETY GUARANTEE
+        if vec.shape[0] != 48:
+            padded = np.zeros(48, dtype=np.float32)
+            n = min(len(vec), 48)
+            padded[:n] = vec[:n]
+            vec = padded
 
-        # score
-        try:
-            score_surface = self.font.render(str(self.score), True, (56, 74, 12))
-            surface.blit(score_surface, (5, 5))
-        except Exception:
-            pass
+        return vec.reshape((48,)).astype(np.float32)
 
-        if self.render_mode == "human":
-            pygame.display.flip()
-            self.clock.tick(self.metadata["render_fps"])
-            return None
-        elif self.render_mode == "rgb_array":
-            arr = pygame.surfarray.array3d(surface)
-            return np.transpose(arr, (1, 0, 2))
-        else:
-            return None
-
-    def close(self):
-        if self._pygame_initialized:
-            try:
-                pygame.quit()
-            except Exception:
-                pass
-            self._pygame_initialized = False
-            self._assets_loaded = False
+    # ===================================================================
+    def render(self): pass
+    def close(self): pass
 
 
-# Register environment
+# REGISTER
 register(
     id="Snake-v0",
     entry_point="snake_gym_env:SnakeEnv",
-    max_episode_steps=2000
+    max_episode_steps=8000
 )

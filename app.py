@@ -1,46 +1,32 @@
-#!/usr/bin/env python3
-"""
-Snake Viewer GUI — fully refactored and corrected.
-
-Key fixes:
-- Model architecture now matches training (64→32→actions)
-- Always uses env-provided obs["features"]
-- Supports both full checkpoints and raw state_dict files
-- Robust metadata inference
-- Clean threading and rendering
-"""
-
 import os
 import threading
-import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from PIL import Image, ImageTk
-import numpy as np
+import gymnasium as gym
 import torch
 import torch.nn as nn
-import gymnasium as gym
+import pygame
 
-import snake_gym_env  # registers Snake-v0
+import snake_gym_env  # ensures Snake-v0 is registered
+
 
 MODEL_DIR = "saved_models"
+GRAPHICS_DIR = "Graphics"
 DEFAULT_GRID = 20
-GRID_CHOICES = [20, 30, 40]
+GRID_CHOICES = [10, 15, 20, 25, 30]
+CELL_SIZE = 40
 
 
-# ---------------------------------------------------------
-# MODEL — must match training architecture EXACTLY
-# ---------------------------------------------------------
 class SnakeQNet(nn.Module):
     def __init__(self, input_dim: int, num_actions: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 512),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(32, num_actions),
+            nn.Linear(256, num_actions),
         )
 
     def forward(self, x):
@@ -49,55 +35,33 @@ class SnakeQNet(nn.Module):
         return self.net(x)
 
 
-# ---------------------------------------------------------
-# SAFE TORCH LOAD
-# ---------------------------------------------------------
 def safe_torch_load(path: str, device: torch.device):
-    try:
-        return torch.load(path, map_location=device)
-    except Exception as e:
-        msg = str(e)
-        if (
-            "Weights only load failed" in msg
-            or "Unsupported global" in msg
-            or "not an allowed global" in msg
-        ):
-            proceed = messagebox.askyesno(
-                "Load fallback",
-                "This checkpoint requires a full load.\n"
-                "Full load can execute code from the file.\n"
-                "Proceed only if you trust this file."
-            )
-            if proceed:
-                return torch.load(path, map_location=device, weights_only=False)
-        raise
+    return torch.load(path, map_location=device)
 
 
-# ---------------------------------------------------------
-# GUI APPLICATION
-# ---------------------------------------------------------
 class SnakeViewerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Snake Viewer")
-        self.geometry("1000x700")
+        self.title("Snake Viewer (Tkinter UI + Pygame Game)")
+        self.geometry("800x320")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.model_meta = None
-        self.env = None
+
         self.play_thread = None
         self.playing = False
-        self.frame_image = None
 
-        self.grid_size = DEFAULT_GRID
+        # Pygame sprite surfaces (set in Pygame thread)
+        self.pg_apple = None
+        self.pg_head = {}
+        self.pg_tail = {}
+        self.pg_body = {}
 
         self._build_ui()
         self.refresh_models()
 
-    # -----------------------------------------------------
-    # UI
-    # -----------------------------------------------------
+    # ---------------- UI ----------------
     def _build_ui(self):
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=8, pady=6)
@@ -105,21 +69,18 @@ class SnakeViewerApp(tk.Tk):
         tk.Label(top, text="Model:").pack(side=tk.LEFT)
         self.model_var = tk.StringVar()
         self.model_combo = ttk.Combobox(
-            top, textvariable=self.model_var, width=60, state="readonly"
+            top, textvariable=self.model_var, width=50, state="readonly"
         )
         self.model_combo.pack(side=tk.LEFT, padx=6)
 
         tk.Button(top, text="Refresh", command=self.refresh_models).pack(side=tk.LEFT, padx=4)
         tk.Button(top, text="Load", command=self.load_selected_model).pack(side=tk.LEFT, padx=4)
 
-        # Controls
         right = tk.Frame(top)
         right.pack(side=tk.RIGHT)
         tk.Button(right, text="Run", command=self.start_run).pack(side=tk.LEFT, padx=4)
         tk.Button(right, text="Pause", command=self.pause_run).pack(side=tk.LEFT, padx=4)
-        tk.Button(right, text="Step", command=self.step_once).pack(side=tk.LEFT, padx=4)
 
-        # Grid selector
         grid_frame = tk.Frame(self)
         grid_frame.pack(fill=tk.X, padx=8, pady=4)
         tk.Label(grid_frame, text="Grid size:").pack(side=tk.LEFT)
@@ -133,37 +94,30 @@ class SnakeViewerApp(tk.Tk):
         )
         self.grid_combo.pack(side=tk.LEFT, padx=6)
 
-        # Speed slider
         speed_frame = tk.Frame(self)
         speed_frame.pack(fill=tk.X, padx=8)
-        tk.Label(speed_frame, text="Speed (ms per frame):").pack(side=tk.LEFT)
+        tk.Label(speed_frame, text="Speed (ms per step):").pack(side=tk.LEFT)
         self.speed_var = tk.IntVar(value=100)
         tk.Scale(
             speed_frame,
-            from_=10, to=500,
+            from_=10,
+            to=500,
             orient=tk.HORIZONTAL,
-            variable=self.speed_var
+            variable=self.speed_var,
         ).pack(fill=tk.X, padx=6, expand=True)
 
-        # Canvas
-        self.canvas = tk.Canvas(self, width=600, height=600, bg="black")
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-        # Info panel
         info = tk.Frame(self)
-        info.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
+        info.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        tk.Label(info, text="Status").pack()
+        tk.Label(info, text="Status").pack(anchor="w")
         self.status_label = tk.Label(info, text="No model loaded", anchor=tk.W, justify=tk.LEFT)
         self.status_label.pack(fill=tk.X, pady=4)
 
-        tk.Label(info, text="Model metadata").pack(pady=(10, 0))
-        self.meta_text = tk.Text(info, width=40, height=20, state=tk.DISABLED)
-        self.meta_text.pack()
+        tk.Label(info, text="Model metadata").pack(anchor="w", pady=(10, 0))
+        self.meta_text = tk.Text(info, width=60, height=8, state=tk.DISABLED)
+        self.meta_text.pack(fill=tk.BOTH, expand=True)
 
-    # -----------------------------------------------------
-    # MODEL LOADING
-    # -----------------------------------------------------
+    # ------------- MODEL LOADING -------------
     def refresh_models(self):
         os.makedirs(MODEL_DIR, exist_ok=True)
         files = sorted([f for f in os.listdir(MODEL_DIR) if f.endswith(".pt")])
@@ -174,14 +128,13 @@ class SnakeViewerApp(tk.Tk):
     def _infer_meta_from_env(self, grid_size: int):
         env = gym.make("Snake-v0", grid_size=grid_size)
         obs, _ = env.reset()
-        feat = np.asarray(obs["features"], dtype=np.float32)
+        feat = obs["features"]
         input_dim = feat.shape[0]
         num_actions = env.action_space.n
         env.close()
         return input_dim, num_actions
 
     def _normalize_checkpoint(self, ckpt, ui_grid):
-        # Full checkpoint
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             input_dim = ckpt.get("input_dim")
             num_actions = ckpt.get("num_actions")
@@ -197,7 +150,6 @@ class SnakeViewerApp(tk.Tk):
                 "grid_size": grid_size,
             }
 
-        # Raw state_dict
         grid_size = ui_grid
         input_dim, num_actions = self._infer_meta_from_env(grid_size)
         return {
@@ -210,7 +162,7 @@ class SnakeViewerApp(tk.Tk):
     def load_selected_model(self):
         sel = self.model_var.get()
         if not sel:
-            messagebox.showinfo("No model", "Select a model file first.")
+            messagebox.showinfo("No model", "Select a model first.")
             return
 
         path = os.path.join(MODEL_DIR, sel)
@@ -245,9 +197,7 @@ class SnakeViewerApp(tk.Tk):
             self.meta_text.insert(tk.END, f"{k}: {v}\n")
         self.meta_text.config(state=tk.DISABLED)
 
-    # -----------------------------------------------------
-    # ENVIRONMENT
-    # -----------------------------------------------------
+    # ------------- ENV / GRID -------------
     def _current_grid_size(self):
         try:
             ui = int(self.grid_var.get())
@@ -263,14 +213,45 @@ class SnakeViewerApp(tk.Tk):
 
     def _make_env(self):
         try:
-            return gym.make("Snake-v0", render_mode="rgb_array", grid_size=self._current_grid_size())
+            return gym.make("Snake-v0", grid_size=self._current_grid_size())
         except Exception as e:
             messagebox.showerror("Env error", f"Failed to create env: {e}")
             return None
 
-    # -----------------------------------------------------
-    # CONTROL ACTIONS
-    # -----------------------------------------------------
+    # ------------- PYGAME SPRITES -------------
+    def _load_pygame_sprites(self):
+        def load(name):
+            path = os.path.join(GRAPHICS_DIR, name + ".png")
+            img = pygame.image.load(path).convert_alpha()
+            img = pygame.transform.scale(img, (CELL_SIZE, CELL_SIZE))
+            return img
+
+        self.pg_apple = load("apple")
+
+        self.pg_head = {
+            "up": load("head_up"),
+            "down": load("head_down"),
+            "left": load("head_left"),
+            "right": load("head_right"),
+        }
+
+        self.pg_tail = {
+            "up": load("tail_up"),
+            "down": load("tail_down"),
+            "left": load("tail_left"),
+            "right": load("tail_right"),
+        }
+
+        self.pg_body = {
+            "horizontal": load("body_horizontal"),
+            "vertical": load("body_vertical"),
+            "tl": load("body_tl"),
+            "tr": load("body_tr"),
+            "bl": load("body_bl"),
+            "br": load("body_br"),
+        }
+
+    # ------------- RUN / PYGAME -------------
     def start_run(self):
         if not self.model:
             messagebox.showinfo("No model", "Load a model first.")
@@ -278,98 +259,146 @@ class SnakeViewerApp(tk.Tk):
         if self.playing:
             return
 
-        self.env = self._make_env()
-        if not self.env:
+        env = self._make_env()
+        if not env:
             return
 
         self.playing = True
-        self.play_thread = threading.Thread(target=self._play_loop, daemon=True)
+        self.status_label.config(text="Running in Pygame...")
+        self.play_thread = threading.Thread(
+            target=self._pygame_loop, args=(env,), daemon=True
+        )
         self.play_thread.start()
-        self.status_label.config(text="Playing...")
 
     def pause_run(self):
         self.playing = False
-        self.status_label.config(text="Paused")
+        self.status_label.config(text="Pause requested (Pygame will close)")
 
-    def step_once(self):
-        if not self.model:
-            messagebox.showinfo("No model", "Load a model first.")
-            return
+    def _infer_head_direction(self, snake):
+        if len(snake) < 2:
+            return "right"
+        hx, hy = snake[0]
+        nx, ny = snake[1]
+        if hy == ny + 1:
+            return "down"
+        if hy == ny - 1:
+            return "up"
+        if hx == nx + 1:
+            return "right"
+        return "left"
 
-        if not self.env:
-            self.env = self._make_env()
-            if not self.env:
-                return
-            self.obs, _ = self.env.reset()
+    def _infer_tail_direction(self, snake):
+        if len(snake) < 2:
+            return "right"
+        tx, ty = snake[-1]
+        px, py = snake[-2]
+        if ty == py + 1:
+            return "down"
+        if ty == py - 1:
+            return "up"
+        if tx == px + 1:
+            return "right"
+        return "left"
 
-        feat = np.asarray(self.obs["features"], dtype=np.float32)
+    def _body_tile(self, prev, cur, nxt):
+        px, py = prev
+        cx, cy = cur
+        nx, ny = nxt
 
-        with torch.no_grad():
-            q = self.model(torch.from_numpy(feat).float().to(self.device))
-            act = int(torch.argmax(q, dim=1).item())
+        if px == nx:
+            return "vertical"
+        if py == ny:
+            return "horizontal"
 
-        self.obs, r, term, trunc, info = self.env.step(act)
-        frame = self.env.render()
-        self._display_frame(frame)
+        if (px < cx and ny < cy) or (nx < cx and py < cy):
+            return "tl"
+        if (px < cx and ny > cy) or (nx < cx and py > cy):
+            return "bl"
+        if (px > cx and ny < cy) or (nx > cx and py < cy):
+            return "tr"
+        return "br"
 
-        self.status_label.config(text=f"Step reward: {r:.2f}")
+    def _pygame_loop(self, env):
+        pygame.init()
 
-        if term or trunc:
-            self.env.close()
-            self.env = None
+        base_env = env.unwrapped
+        grid = base_env.grid_size
 
-    # -----------------------------------------------------
-    # PLAY LOOP
-    # -----------------------------------------------------
-    def _play_loop(self):
-        try:
-            self.obs, _ = self.env.reset()
+        screen = pygame.display.set_mode((grid * CELL_SIZE, grid * CELL_SIZE))
+        pygame.display.set_caption("Snake (Pygame)")
+        clock = pygame.time.Clock()
 
-            for _ in range(2000):
-                if not self.playing:
-                    break
+        self._load_pygame_sprites()
 
-                feat = np.asarray(self.obs["features"], dtype=np.float32)
+        color1 = (167, 209, 93)
+        color2 = (155, 198, 83)
 
-                with torch.no_grad():
-                    q = self.model(torch.from_numpy(feat).float().to(self.device))
-                    act = int(torch.argmax(q, dim=1).item())
+        obs, _ = env.reset()
+        running = True
 
-                self.obs, r, term, trunc, info = self.env.step(act)
-                frame = self.env.render()
+        while running and self.playing:
+            delay_ms = self.speed_var.get()
+            delay_ms = max(10, delay_ms)
+            clock.tick(1000 // delay_ms)
 
-                self.after(0, self._display_frame, frame)
-                self.after(0, self.status_label.config,
-                           {"text": f"Reward: {r:.2f} Score: {info.get('score', '')}"})
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    self.playing = False
 
-                if term or trunc:
-                    break
+            with torch.no_grad():
+                feat = torch.tensor(obs["features"], dtype=torch.float32, device=self.device)
+                q = self.model(feat)
+                action = int(torch.argmax(q).item())
 
-                time.sleep(self.speed_var.get() / 1000.0)
+            obs, reward, terminated, truncated, info = env.step(action)
 
-        except Exception as e:
-            self.after(0, messagebox.showerror, "Runtime error", f"Error during play: {e}")
+            coords = obs["coords"]
+            snake = [(x, y) for (x, y) in coords[:-1] if x >= 0]
+            fx, fy = coords[-1]
 
-        finally:
-            self.playing = False
-            if self.env:
-                self.env.close()
-            self.env = None
-            self.after(0, self.status_label.config, {"text": "Stopped"})
+            # Background
+            for y in range(grid):
+                for x in range(grid):
+                    color = color1 if (x + y) % 2 == 0 else color2
+                    pygame.draw.rect(
+                        screen,
+                        color,
+                        (x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE),
+                    )
 
-    # -----------------------------------------------------
-    # RENDERING
-    # -----------------------------------------------------
-    def _display_frame(self, frame):
-        if frame is None:
-            return
-        img = Image.fromarray(frame.astype("uint8"))
-        w = self.canvas.winfo_width() or 600
-        h = self.canvas.winfo_height() or 600
-        img = img.resize((w, h), Image.NEAREST)
-        self.frame_image = ImageTk.PhotoImage(img)
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.frame_image)
+            # Fruit
+            screen.blit(self.pg_apple, (fx * CELL_SIZE, fy * CELL_SIZE))
 
+            if snake:
+                # Head
+                hx, hy = snake[0]
+                head_dir = self._infer_head_direction(snake)
+                screen.blit(self.pg_head[head_dir], (hx * CELL_SIZE, hy * CELL_SIZE))
+
+                # Body
+                for i in range(1, len(snake) - 1):
+                    px, py = snake[i - 1]
+                    cx, cy = snake[i]
+                    nx, ny = snake[i + 1]
+                    tile = self._body_tile((px, py), (cx, cy), (nx, ny))
+                    screen.blit(self.pg_body[tile], (cx * CELL_SIZE, cy * CELL_SIZE))
+
+                # Tail
+                if len(snake) > 1:
+                    tx, ty = snake[-1]
+                    tail_dir = self._infer_tail_direction(snake)
+                    screen.blit(self.pg_tail[tail_dir], (tx * CELL_SIZE, ty * CELL_SIZE))
+
+            pygame.display.flip()
+
+            if terminated or truncated:
+                obs, _ = env.reset()
+
+        pygame.quit()
+        env.close()
+        self.playing = False
+        self.status_label.after(0, lambda: self.status_label.config(text="Stopped"))
 
 if __name__ == "__main__":
     app = SnakeViewerApp()
