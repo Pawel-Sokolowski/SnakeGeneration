@@ -1,4 +1,3 @@
-# env_fast.py
 import torch
 import torch.nn.functional as F   # required for one_hot
 
@@ -42,11 +41,14 @@ class TorchSnakeEnv:
         self.max_steps = int(max_steps)
         self.device = device
 
+        # base rewards / penalties
         self.step_penalty = float(step_penalty)
         self.eat_reward = float(eat_reward)
         self.crash_penalty = float(crash_penalty)
         self.timeout_penalty = float(timeout_penalty)
         self.length_reward_scale = float(length_reward_scale)
+
+        # shaping_scale kept for compatibility; shaping_raw is returned and shaping applied externally
         self.shaping_scale = float(shaping_scale)
 
         self.no_eat_limit = int(no_eat_limit)
@@ -135,11 +137,9 @@ class TorchSnakeEnv:
 
             # choose head positions safely away from edges so initial 3-cell body fits
             if self.g >= 5:
-                # head in [2, g-3] so ±1, ±2 stay in [0, g-1]
                 low = 2
                 high = self.g - 2  # torch.randint is [low, high)
             else:
-                # tiny grids: fall back to full range; body logic still works for g>=3
                 low = 0
                 high = self.g
 
@@ -152,11 +152,9 @@ class TorchSnakeEnv:
                 hy = torch.randint(low, high, (k,), device=self.device)
                 dir_rand = torch.randint(0, 4, (k,), device=self.device)
 
-            # compute body coordinates for each chosen direction
             xs = torch.zeros((k, 3), dtype=torch.long, device=self.device)
             ys = torch.zeros((k, 3), dtype=torch.long, device=self.device)
 
-            # direction 0: right  -> body extends left
             m0 = dir_rand == 0
             if m0.any():
                 i = torch.where(m0)[0]
@@ -164,7 +162,6 @@ class TorchSnakeEnv:
                 xs[i, 1] = hx[i] - 1; ys[i, 1] = hy[i]
                 xs[i, 2] = hx[i] - 2; ys[i, 2] = hy[i]
 
-            # direction 1: down -> body extends up
             m1 = dir_rand == 1
             if m1.any():
                 i = torch.where(m1)[0]
@@ -172,7 +169,6 @@ class TorchSnakeEnv:
                 xs[i, 1] = hx[i]; ys[i, 1] = hy[i] - 1
                 xs[i, 2] = hx[i]; ys[i, 2] = hy[i] - 2
 
-            # direction 2: left -> body extends right
             m2 = dir_rand == 2
             if m2.any():
                 i = torch.where(m2)[0]
@@ -180,7 +176,6 @@ class TorchSnakeEnv:
                 xs[i, 1] = hx[i] + 1; ys[i, 1] = hy[i]
                 xs[i, 2] = hx[i] + 2; ys[i, 2] = hy[i]
 
-            # direction 3: up -> body extends down
             m3 = dir_rand == 3
             if m3.any():
                 i = torch.where(m3)[0]
@@ -188,26 +183,21 @@ class TorchSnakeEnv:
                 xs[i, 1] = hx[i]; ys[i, 1] = hy[i] + 1
                 xs[i, 2] = hx[i]; ys[i, 2] = hy[i] + 2
 
-            # write into circular buffers: assign first 3 positions for each env
             self.snake_x[idx, :3] = xs
             self.snake_y[idx, :3] = ys
 
-            # set direction for those indices
             self.direction[idx] = dir_rand
 
-            # mark occupancy: flatten per-env coords and assign
-            flat_idx = idx.repeat_interleave(3)        # shape (k*3,)
-            flat_x = xs.view(-1)                       # shape (k*3,)
-            flat_y = ys.view(-1)                       # shape (k*3,)
+            flat_idx = idx.repeat_interleave(3)
+            flat_x = xs.view(-1)
+            flat_y = ys.view(-1)
             self.occupied[flat_idx, flat_y, flat_x] = True
 
-            # reset head history pointers
             self.head_hist_x[idx] = 0
             self.head_hist_y[idx] = 0
             self.hist_ptr[idx] = 0
 
         else:
-            # deterministic center placement (legacy behavior)
             m = self.g // 2
             self.snake_x[idx, :3] = torch.tensor([m, m - 1, m - 2], device=self.device)
             self.snake_y[idx, :3] = m
@@ -297,11 +287,9 @@ class TorchSnakeEnv:
 
         max_md = max(1, 2 * (self.g - 1))
         delta = (dist_before - dist_after).float() / max_md
-        shaping = self.shaping_scale * delta.clamp(min=0.0)
+        shaping_raw = delta.clamp(min=0.0)  # raw shaping in [0,1] per env
 
         move = alive & ~collision
-        reward += shaping * move.float()
-
         if move.any():
             self.head[move] = (self.head[move] - 1) % (self.g * self.g)
             h = self.head[move]
@@ -347,7 +335,15 @@ class TorchSnakeEnv:
             self.stat_noeat[no_eat] += 1
             self.done |= no_eat
 
-        return self._features(), reward, self.done
+        # Build info dict with shaping and diagnostics
+        info = {
+            "shaping_raw": shaping_raw,            # normalized positive delta in [0,1]
+            "dist_before": dist_before,            # integer distances
+            "dist_after": dist_after,              # integer distances
+            "cycle_mask": cycle_mask,              # boolean mask
+        }
+
+        return self._features(), reward, self.done, info
 
     def _place_fruit(self, idx):
         if idx.numel() == 0:
