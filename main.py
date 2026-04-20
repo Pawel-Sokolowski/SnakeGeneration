@@ -1,25 +1,30 @@
 # main.py
 """
-Snake RL pipeline
+Hands-off auto-benchmark and train runner for Snake RL (MLP and CNN).
 
-Order:
-1) 10x10 EA short MLP
-2) 10x10 EA short CNN
-3) 10x10 MLP
-4) 20x20 MLP
-5) 10x10 CNN
-6) 20x20 CNN
-7) 20x20 EA from MLP
-8) 20x20 EA from CNN
+Behavior (fully automatic, no CLI required):
+- Runs a short automated benchmark over a built-in grid of (batch, n_envs) pairs.
+- Repeats each config a small number of times to reduce noise.
+- Uses a weighted score over median it/s, median p90, median p50 and mean TD-error
+  to select the best config.
+- Runs a small EA grid (pop_size × ea_envs) with small env counts and picks the best EA config.
+- Runs final training for each model using the chosen training config and runs a final EA using the chosen EA config.
+- Saves benchmark CSVs and temporary .pt checkpoints under benchmarks/.
+- Saves final training and final EA checkpoints under saved_models/.
+- Designed to run hands-off: just `python main.py`.
 
-Logging:
-- For each train_* run, every 10% of steps:
-  [step/steps] max_len=... p90=...
+Notes:
+- Place this file next to your `env_fast.py` and `models.py`.
+- The script runs sequentially and is conservative about GPU usage (one training job at a time).
 """
 
 import os
+import time
 import math
+import csv
+import copy
 from collections import deque
+from statistics import median
 
 import numpy as np
 import torch
@@ -27,118 +32,108 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import trange
 
+# Local imports (must exist)
 from env_fast import TorchSnakeEnv
 from models import DuelingMLP, DuelingCNN
 
 # -------------------------
-# Global config
+# Directories
 # -------------------------
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+CKPT_DIR = "saved_models"
+BENCH_DIR = "benchmarks"
+os.makedirs(CKPT_DIR, exist_ok=True)
+os.makedirs(BENCH_DIR, exist_ok=True)
+
+# -------------------------
+# Machine tuning (10 CPU cores)
+# -------------------------
+CPU_CORES = 10
+os.environ.setdefault("OMP_NUM_THREADS", str(CPU_CORES))
+os.environ.setdefault("MKL_NUM_THREADS", str(CPU_CORES))
+torch.set_num_threads(CPU_CORES)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# -------------------------
+# RL defaults and hyperparams
+# -------------------------
 ACTIONS = 3
-
 STACK = 3
 FEAT_DIM_SINGLE = 34
 FEAT_DIM = FEAT_DIM_SINGLE * STACK
 
-N_ENVS_DEFAULT = 8192
-BATCH = 4096
-REPLAY_SIZE = 300_000
+# -------------------------
+# Automatic grids (no CLI)
+# -------------------------
+# Training grid tuned for 5GB GPU + 10 CPU cores
+TRAIN_BATCHES = [1024, 2048, 4096]   # training batch sizes to test
+TRAIN_ENVS = [512, 1024]             # n_envs to test
+REPEATS = 2                          # repeats per config (keeps runtime reasonable)
+SHORT_STEPS = 1000                   # short-run steps per config
+
+# EA grid (big pop sizes, small env counts as requested)
+EA_POP_SIZES = [64, 128, 256]
+EA_ENVS = [8, 16, 32]
+EA_GENERATIONS = 2
+EA_EVAL_STEPS = 100
+
+REPLAY_SIZE = 1_000_000
 WARMUP = 10_000
 
 GAMMA = 0.99
-LR = 5e-5
-TARGET_UPDATE = 1000
-UPDATES_PER_TRAIN = 2
+LR = 3e-5
+UPDATES_PER_TRAIN = 1
 N_STEP = 3
 
-PER_ALPHA = 0.6
-PER_EPS = 1e-4
-BETA_START = 0.4
-BETA_FRAMES = 1_000_000
+PER_ALPHA = 0.7
+PER_EPS = 1e-5
+BETA_START = 0.3
+BETA_FRAMES = 2_000_000
 
 TRAIN_EVERY = 4
-ACCUM_STEPS = 2
+ACCUM_STEPS = 1
 BASE_SHAPING = 0.03
 EPS_END = 0.05
 
-CKPT_DIR = "saved_models"
-os.makedirs(CKPT_DIR, exist_ok=True)
-
+TAU = 0.005
 
 # -------------------------
 # Utilities
 # -------------------------
-def make_epsilon_fn(total_train_steps, eps_start=0.9, eps_end=EPS_END, decay_frac=0.6):
-    decay_steps = max(1, int(total_train_steps * float(decay_frac)))
+def linear_anneal(start, end, progress):
+    return float(start + (end - start) * max(0.0, min(1.0, progress)))
 
+def shaping_coeffs(pretrain, step, total_steps, grid):
+    if pretrain:
+        lam_dist = 0.20
+        lam_len = 0.12 if grid < 20 else 0.15
+    else:
+        lam_dist_start = 0.20
+        lam_len_start = 0.12 if grid < 20 else 0.15
+        lam_dist_target = 0.05
+        lam_len_target = 0.05
+        prog = min(1.0, step / max(1, int(total_steps * 0.3)))
+        lam_dist = linear_anneal(lam_dist_start, lam_dist_target, prog)
+        lam_len = linear_anneal(lam_len_start, lam_len_target, prog)
+    lam_time = -0.001
+    lam_cycle = -1.0
+    return lam_dist, lam_len, lam_time, lam_cycle
+
+def make_scaled_epsilon_fn(grid, total_steps, eps_start=1.0, eps_end=EPS_END):
+    scale = grid / 10.0
+    decay_steps = max(1, int(total_steps * 0.7 * scale))
     def eps_fn(step):
         t = min(1.0, step / decay_steps)
         return float(eps_start + (eps_end - eps_start) * t)
-
     return eps_fn
 
-
-def flatten_params(model):
+def soft_update(tgt, src, tau=TAU):
     with torch.no_grad():
-        parts = []
-        shapes = []
-        for p in model.parameters():
-            arr = p.detach().cpu().numpy().ravel()
-            parts.append(arr)
-            shapes.append(p.shape)
-        flat = np.concatenate(parts).astype(np.float32)
-    return flat, shapes
-
-
-def unflatten_to_model(model, flat, shapes):
-    with torch.no_grad():
-        offset = 0
-        for p, shape in zip(model.parameters(), shapes):
-            size = int(np.prod(shape))
-            chunk = flat[offset:offset + size].astype(np.float32)
-            chunk_t = torch.from_numpy(chunk.reshape(shape)).to(p.device)
-            p.copy_(chunk_t)
-            offset += size
-
-
-def sanity_step_vector(model, env, obs_stack):
-    model.eval()
-    with torch.no_grad():
-        qvals = model(obs_stack)
-        if qvals.shape[1] != ACTIONS:
-            print(f"[sanity] wrong action dim: {qvals.shape}")
-            return False
-        act = qvals.argmax(1)
-        nf, r, d = env.step(act)
-        if nf.shape[0] != obs_stack.shape[0]:
-            print(f"[sanity] wrong batch size from env: {nf.shape[0]}")
-            return False
-    return True
-
-
-def sanity_step_cnn(model, env):
-    model.eval()
-    with torch.no_grad():
-        grid = env.grid_observation().to(DEVICE)
-        qvals = model(grid)
-        if qvals.shape[1] != ACTIONS:
-            print(f"[sanity CNN] wrong action dim: {qvals.shape}")
-            return False
-        act = qvals.argmax(1)
-        nf, r, d = env.step(act)
-        if nf.shape[0] != grid.shape[0]:
-            print(f"[sanity CNN] wrong batch size from env: {nf.shape[0]}")
-            return False
-    return True
-
+        for tp, sp in zip(tgt.parameters(), src.parameters()):
+            tp.data.copy_(tp.data * (1.0 - tau) + sp.data * tau)
 
 # -------------------------
-# PER SumTree
+# Minimal SumTree + PER replay
 # -------------------------
 class SumTree:
     def __init__(self, capacity):
@@ -148,27 +143,22 @@ class SumTree:
             self.tree_size *= 2
         self.tree = np.zeros(2 * self.tree_size, dtype=np.float32)
         self.size = 0
-
     def _propagate(self, idx, change):
         parent = idx // 2
         while parent >= 1:
             self.tree[parent] += change
             parent //= 2
-
     def update(self, idx, priority):
         tree_idx = idx + self.tree_size
         change = priority - self.tree[tree_idx]
         self.tree[tree_idx] = priority
         self._propagate(tree_idx, change)
-
     def add(self, idx, priority):
         self.update(idx, priority)
         if self.size < self.capacity:
             self.size += 1
-
     def total(self):
         return float(self.tree[1])
-
     def find_prefixsum_idx(self, s):
         idx = 1
         while idx < self.tree_size:
@@ -180,27 +170,22 @@ class SumTree:
                 idx = left + 1
         return idx - self.tree_size
 
-
 class PrioritizedReplaySumTree:
     def __init__(self, capacity, feat_dim, device=DEVICE, alpha=PER_ALPHA, eps=PER_EPS):
         self.capacity = int(capacity)
         self.device = device
         self.alpha = float(alpha)
         self.eps = float(eps)
-
         self.f = torch.zeros((self.capacity, feat_dim), dtype=torch.float16, device=device)
         self.nf = torch.zeros_like(self.f)
         self.a = torch.zeros(self.capacity, dtype=torch.long, device=device)
         self.r = torch.zeros(self.capacity, dtype=torch.float32, device=device)
         self.d = torch.zeros(self.capacity, dtype=torch.float32, device=device)
-
         self.sumtree = SumTree(self.capacity)
         self.next_idx = 0
         self.full = False
-
     def size(self):
         return self.capacity if self.full else self.next_idx
-
     def add_batch(self, f_batch, a_batch, r_batch, nf_batch, d_batch, priorities=None):
         b = f_batch.size(0)
         idxs = (torch.arange(b, device=self.device) + self.next_idx) % self.capacity
@@ -209,7 +194,6 @@ class PrioritizedReplaySumTree:
         self.a[idxs] = a_batch
         self.r[idxs] = r_batch
         self.d[idxs] = d_batch.float()
-
         if priorities is None:
             current_size = self.size()
             if current_size > 0:
@@ -222,22 +206,20 @@ class PrioritizedReplaySumTree:
             priorities = np.full((b,), max_p, dtype=np.float32)
         else:
             priorities = priorities.astype(np.float32)
-
         priorities = np.maximum(priorities, 1e-12).astype(np.float32)
         for i, p in enumerate(priorities):
             data_idx = (self.next_idx + i) % self.capacity
-            self.sumtree.add(data_idx, float((abs(p) + self.eps) ** self.alpha))
+            val = float((abs(p) + self.eps) ** self.alpha)
+            val = max(val, 1e-6)
+            self.sumtree.add(data_idx, val)
         self.next_idx = (self.next_idx + b) % self.capacity
         if self.next_idx == 0:
             self.full = True
-
     def sample_batch(self, batch_size, beta=1.0):
         m = self.size()
         if m == 0:
             raise RuntimeError("Sampling from empty replay")
-
         total = self.sumtree.total()
-
         if total <= 0 or not np.isfinite(total):
             idxs = np.random.randint(0, m, size=(batch_size,), dtype=np.int64)
             priorities = np.ones(batch_size, dtype=np.float32)
@@ -259,28 +241,21 @@ class PrioritizedReplaySumTree:
                 priorities.append(float(self.sumtree.tree[self.sumtree.tree_size + data_idx]))
             idxs = np.array(idxs, dtype=np.int64)
             priorities = np.array(priorities, dtype=np.float32)
-
         probs = priorities / (total + 1e-12) if total > 0 else (np.ones_like(priorities, dtype=np.float32) / float(m))
         probs = np.maximum(probs, 1e-12)
-
         weights = (m * probs) ** (-beta)
         max_w = np.max(weights)
         if not np.isfinite(max_w) or max_w <= 0:
             max_w = 1.0
         weights = weights / (max_w + 1e-12)
-
         idxs_t = torch.from_numpy(idxs).to(torch.long).to(self.device)
-
         f_b = self.f[idxs_t].float()
         a_b = self.a[idxs_t]
         r_b = self.r[idxs_t]
         nf_b = self.nf[idxs_t].float()
         d_b = self.d[idxs_t]
-
         weights_t = torch.from_numpy(weights.astype(np.float32)).float().to(self.device)
-
         return f_b, a_b, r_b, nf_b, d_b, idxs, weights_t
-
     def update_priorities(self, idxs, td_errors):
         if isinstance(td_errors, torch.Tensor):
             td = td_errors.detach().cpu().numpy().astype(np.float32)
@@ -288,42 +263,22 @@ class PrioritizedReplaySumTree:
             td = np.asarray(td_errors, dtype=np.float32)
         for i, data_idx in enumerate(idxs):
             p = float((abs(td[i]) + self.eps) ** self.alpha)
-            p = max(p, 1e-12)
+            p = max(p, 1e-6)
             self.sumtree.update(int(data_idx), p)
 
-
 # -------------------------
-# MLP training (vector)
+# Training loops (MLP + CNN)
+# Each returns metrics dict: {"it_per_s", "final_p90", "final_p50", "final_p10", "final_max", "mean_td"}
 # -------------------------
-def train_mlp(
-    grid,
-    steps,
-    ckpt_path,
-    load=None,
-    n_envs=N_ENVS_DEFAULT,
-    max_steps_scale=50,
-    success_length_threshold=None,
-    eps_fn=None,
-    random_start=True,
-    seed=None,
-):
-    print(f"\n=== TRAIN MLP GRID {grid} (n_envs={n_envs}) ===")
-    print(f"≈ {(steps * n_envs) / 1e6:.1f}M env steps")
-
-    max_steps = grid * grid * max(1, int(max_steps_scale))
-
+def train_mlp(grid, steps, ckpt_path, batch_size, n_envs, seed=None):
+    max_steps = grid * grid * max(1, int(20))
     env = TorchSnakeEnv(
-        n=n_envs,
-        g=grid,
-        max_steps=max_steps,
-        device=DEVICE,
+        n=n_envs, g=grid, max_steps=max_steps, device=DEVICE,
         shaping_scale=BASE_SHAPING * (grid / 10),
         eat_reward=1.5,
-        length_reward_scale=0.12,
-        no_eat_limit=400,
-        success_length_threshold=success_length_threshold,
-        random_start=random_start,
-        seed=seed,
+        length_reward_scale=0.12 if grid < 20 else 0.15,
+        no_eat_limit=400 if grid < 20 else 600,
+        random_start=True, seed=seed,
     )
 
     obs_single = env.reset().to(DEVICE)
@@ -334,22 +289,9 @@ def train_mlp(
     def get_stacked():
         return torch.cat(list(obs_stack), dim=1)
 
-    obs_f = get_stacked().to(DEVICE).float()
-
     q = DuelingMLP(FEAT_DIM).to(DEVICE)
     tgt = DuelingMLP(FEAT_DIM).to(DEVICE)
-
-    if load is not None and os.path.exists(load):
-        ckpt = torch.load(load, map_location=DEVICE)
-        if "q" in ckpt:
-            q.load_state_dict(ckpt["q"])
-        else:
-            q.load_state_dict(ckpt)
-
     tgt.load_state_dict(q.state_dict())
-
-    if not sanity_step_vector(q, env, obs_f):
-        raise RuntimeError("MLP sanity check failed")
 
     opt = torch.optim.Adam(q.parameters(), lr=LR)
     scaler = GradScaler()
@@ -371,7 +313,7 @@ def train_mlp(
         if replay.size() <= WARMUP:
             return None
         beta = beta_by_frame(global_step)
-        mini_batch = BATCH // ACCUM_STEPS
+        mini_batch = max(1, batch_size // ACCUM_STEPS)
         opt.zero_grad(set_to_none=True)
         all_idxs = []
         all_td = []
@@ -395,11 +337,11 @@ def train_mlp(
         replay.update_priorities(flat_idxs, torch.from_numpy(flat_td).to(DEVICE))
         return flat_td
 
-    if eps_fn is None:
-        eps_fn = make_epsilon_fn(steps)
-
+    eps_fn = make_scaled_epsilon_fn(grid, steps)
     log_interval = max(1, steps // 10)
 
+    t_start = time.time()
+    td_accum = []
     pbar = trange(steps)
     for step in pbar:
         eps = eps_fn(step)
@@ -412,17 +354,23 @@ def train_mlp(
         if rnd.any():
             act[rnd] = torch.randint(0, ACTIONS, (rnd.sum().item(),), device=DEVICE)
 
-        nf_single, r, d = env.step(act)
-        nf_single = nf_single.to(DEVICE)
-        r = r.to(DEVICE)
-        d = d.to(DEVICE)
+        nf_single, r, d, info = env.step(act)
+        nf_single = nf_single.to(DEVICE); r = r.to(DEVICE); d = d.to(DEVICE)
+
+        pretrain = (grid == 10)
+        lam_dist, lam_len, lam_time, lam_cycle = shaping_coeffs(pretrain, step, steps, grid)
+        shaping_raw = info.get("shaping_raw") if isinstance(info, dict) else None
+        if shaping_raw is None:
+            shaping_raw = torch.zeros_like(r)
+        eat_mask = (r > 0).float()
+        shaped = r + lam_dist * shaping_raw + lam_len * eat_mask + lam_time
 
         if N_STEP > 1:
             reward_buf[:, :-1] = reward_buf[:, 1:]
             done_buf[:, :-1] = done_buf[:, 1:]
             next_obs_buf[:, :-1, :] = next_obs_buf[:, 1:, :]
             action_buf[:, :-1] = action_buf[:, 1:]
-        reward_buf[:, -1] = r
+        reward_buf[:, -1] = shaped
         done_buf[:, -1] = d.float()
         next_obs_buf[:, -1, :] = nf_single
         action_buf[:, -1] = act
@@ -477,8 +425,11 @@ def train_mlp(
             steps_since_reset[idxs_ready] = 0
 
         if (step % TRAIN_EVERY == 0) and (replay.size() > WARMUP):
+            td = run_training_step(step)
+            if td is not None:
+                td_accum.append(np.mean(np.abs(td)))
             for _ in range(UPDATES_PER_TRAIN):
-                run_training_step(step)
+                soft_update(tgt, q)
 
         just_done = d & (~prev_done)
         if just_done.any():
@@ -495,70 +446,46 @@ def train_mlp(
         prev_done = d.clone()
         obs_stack.append(nf_single.clone())
 
-        if step % TARGET_UPDATE == 0:
-            tgt.load_state_dict(q.state_dict())
-
         if step > 0 and step % log_interval == 0:
             lengths = env.length.cpu().numpy()
-            max_len = int(lengths.max())
             p90 = float(np.percentile(lengths, 90))
-            print(f"[MLP {grid}x{grid}] [{step}/{steps}] max_len={max_len} p90={p90:.2f}")
+            p50 = float(np.percentile(lengths, 50))
+            pbar.set_description(f"MLP g{grid} B{batch_size} E{n_envs} step{step} p90={p90:.1f} p50={p50:.1f}")
+
+    elapsed = time.time() - t_start
+    it_per_s = steps / max(1e-9, elapsed)
+    lengths = env.length.cpu().numpy()
+    final_p90 = float(np.percentile(lengths, 90))
+    final_p50 = float(np.percentile(lengths, 50))
+    final_p10 = float(np.percentile(lengths, 10))
+    final_max = float(lengths.max())
+    mean_td = float(np.mean(td_accum)) if td_accum else float("nan")
 
     torch.save({"q": q.state_dict()}, ckpt_path)
-    print(f"✅ Saved MLP model to {ckpt_path}")
-    return ckpt_path
+    return {
+        "it_per_s": it_per_s,
+        "final_p90": final_p90,
+        "final_p50": final_p50,
+        "final_p10": final_p10,
+        "final_max": final_max,
+        "mean_td": mean_td,
+    }
 
-
-# -------------------------
-# CNN training (grid)
-# -------------------------
-def train_cnn(
-    grid,
-    steps,
-    ckpt_path,
-    load=None,
-    n_envs=N_ENVS_DEFAULT,
-    max_steps_scale=50,
-    success_length_threshold=None,
-    eps_fn=None,
-    random_start=True,
-    seed=None,
-):
-    print(f"\n=== TRAIN CNN GRID {grid} (n_envs={n_envs}) ===")
-    print(f"≈ {(steps * n_envs) / 1e6:.1f}M env steps")
-
-    max_steps = grid * grid * max(1, int(max_steps_scale))
-
+def train_cnn(grid, steps, ckpt_path, batch_size, n_envs, seed=None):
+    max_steps = grid * grid * max(1, int(20))
     env = TorchSnakeEnv(
-        n=n_envs,
-        g=grid,
-        max_steps=max_steps,
-        device=DEVICE,
+        n=n_envs, g=grid, max_steps=max_steps, device=DEVICE,
         shaping_scale=BASE_SHAPING * (grid / 10),
         eat_reward=1.5,
-        length_reward_scale=0.12,
-        no_eat_limit=400,
-        success_length_threshold=success_length_threshold,
-        random_start=random_start,
-        seed=seed,
+        length_reward_scale=0.12 if grid < 20 else 0.15,
+        no_eat_limit=400 if grid < 20 else 600,
+        random_start=True, seed=seed,
     )
 
     env.reset().to(DEVICE)
-
     q = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
     tgt = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
-
-    if load is not None and os.path.exists(load):
-        ckpt = torch.load(load, map_location=DEVICE)
-        if "q" in ckpt:
-            q.load_state_dict(ckpt["q"])
-        else:
-            q.load_state_dict(ckpt)
-
     tgt.load_state_dict(q.state_dict())
-
-    if not sanity_step_cnn(q, env):
-        raise RuntimeError("CNN sanity check failed")
 
     opt = torch.optim.Adam(q.parameters(), lr=LR)
     scaler = GradScaler()
@@ -581,7 +508,7 @@ def train_cnn(
         if replay.size() <= WARMUP:
             return None
         beta = beta_by_frame(global_step)
-        mini_batch = BATCH // ACCUM_STEPS
+        mini_batch = max(1, batch_size // ACCUM_STEPS)
         opt.zero_grad(set_to_none=True)
         all_idxs = []
         all_td = []
@@ -607,11 +534,11 @@ def train_cnn(
         replay.update_priorities(flat_idxs, torch.from_numpy(flat_td).to(DEVICE))
         return flat_td
 
-    if eps_fn is None:
-        eps_fn = make_epsilon_fn(steps)
-
+    eps_fn = make_scaled_epsilon_fn(grid, steps)
     log_interval = max(1, steps // 10)
 
+    t_start = time.time()
+    td_accum = []
     pbar = trange(steps)
     for step in pbar:
         eps = eps_fn(step)
@@ -624,18 +551,24 @@ def train_cnn(
         if rnd.any():
             act[rnd] = torch.randint(0, ACTIONS, (rnd.sum().item(),), device=DEVICE)
 
-        nf, r, d = env.step(act)
-        nf = nf.to(DEVICE)
-        r = r.to(DEVICE)
-        d = d.to(DEVICE)
+        nf, r, d, info = env.step(act)
+        nf = nf.to(DEVICE); r = r.to(DEVICE); d = d.to(DEVICE)
         nf_grid = env.grid_observation().to(DEVICE)
+
+        pretrain = (grid == 10)
+        lam_dist, lam_len, lam_time, lam_cycle = shaping_coeffs(pretrain, step, steps, grid)
+        shaping_raw = info.get("shaping_raw") if isinstance(info, dict) else None
+        if shaping_raw is None:
+            shaping_raw = torch.zeros_like(r)
+        eat_mask = (r > 0).float()
+        shaped = r + lam_dist * shaping_raw + lam_len * eat_mask + lam_time
 
         if N_STEP > 1:
             reward_buf[:, :-1] = reward_buf[:, 1:]
             done_buf[:, :-1] = done_buf[:, 1:]
             next_obs_buf[:, :-1, :, :, :] = next_obs_buf[:, 1:, :, :, :]
             action_buf[:, :-1] = action_buf[:, 1:]
-        reward_buf[:, -1] = r
+        reward_buf[:, -1] = shaped
         done_buf[:, -1] = d.float()
         next_obs_buf[:, -1, :, :, :] = nf_grid
         action_buf[:, -1] = act
@@ -683,8 +616,11 @@ def train_cnn(
             steps_since_reset[idxs_ready] = 0
 
         if (step % TRAIN_EVERY == 0) and (replay.size() > WARMUP):
+            td = run_training_step(step)
+            if td is not None:
+                td_accum.append(np.mean(np.abs(td)))
             for _ in range(UPDATES_PER_TRAIN):
-                run_training_step(step)
+                soft_update(tgt, q)
 
         just_done = d & (~prev_done)
         if just_done.any():
@@ -697,363 +633,357 @@ def train_cnn(
 
         prev_done = d.clone()
 
-        if step % TARGET_UPDATE == 0:
-            tgt.load_state_dict(q.state_dict())
-
         if step > 0 and step % log_interval == 0:
             lengths = env.length.cpu().numpy()
-            max_len = int(lengths.max())
             p90 = float(np.percentile(lengths, 90))
-            print(f"[CNN {grid}x{grid}] [{step}/{steps}] max_len={max_len} p90={p90:.2f}")
+            p50 = float(np.percentile(lengths, 50))
+            pbar.set_description(f"CNN g{grid} B{batch_size} E{n_envs} step{step} p90={p90:.1f} p50={p50:.1f}")
+
+    elapsed = time.time() - t_start
+    it_per_s = steps / max(1e-9, elapsed)
+    lengths = env.length.cpu().numpy()
+    final_p90 = float(np.percentile(lengths, 90))
+    final_p50 = float(np.percentile(lengths, 50))
+    final_p10 = float(np.percentile(lengths, 10))
+    final_max = float(lengths.max())
+    mean_td = float(np.mean(td_accum)) if td_accum else float("nan")
 
     torch.save({"q": q.state_dict()}, ckpt_path)
-    print(f"✅ Saved CNN model to {ckpt_path}")
-    return ckpt_path
-
+    return {
+        "it_per_s": it_per_s,
+        "final_p90": final_p90,
+        "final_p50": final_p50,
+        "final_p10": final_p10,
+        "final_max": final_max,
+        "mean_td": mean_td,
+    }
 
 # -------------------------
-# EA helpers (MLP)
+# EA helpers (configurable)
 # -------------------------
-def evaluate_mlp_individual(flat_weights, shapes, episodes, device, grid, batch_size, random_start=True):
-    model = DuelingMLP(FEAT_DIM).to(device)
-    unflatten_to_model(model, flat_weights, shapes)
+def evaluate_model_on_env(model, env, steps_eval=100):
     model.eval()
+    with torch.no_grad():
+        for _ in range(steps_eval):
+            obs = env.grid_observation().to(DEVICE)
+            qvals = model(obs)
+            act = qvals.argmax(1)
+            nf, r, d, info = env.step(act)
+    lengths = env.length.cpu().numpy()
+    return float(np.percentile(lengths, 50))
 
-    max_steps = grid * grid * 50
-    env = TorchSnakeEnv(n=episodes, g=grid, max_steps=max_steps, device=device, random_start=random_start)
-    obs = env.reset().to(device)
-
-    stack = deque(maxlen=STACK)
-    for _ in range(STACK):
-        stack.append(obs.clone())
-
-    def get_stack():
-        return torch.cat(list(stack), dim=1)
-
-    done = torch.zeros(episodes, dtype=torch.bool, device=device)
-    returns = torch.zeros(episodes, device=device)
-
-    while not done.all():
-        obs_f = get_stack().float()
-        with torch.no_grad():
-            qvals = model(obs_f)
-        acts = qvals.argmax(1)
-        nf, r, d = env.step(acts)
-        returns += r
-        done |= d
-        stack.append(nf.to(device))
-
-    lengths = env.length.cpu().numpy().astype(np.int32)
-    mean_return = float(returns.mean().cpu().numpy())
-    return mean_return, lengths
-
-
-def run_ea_short_10x10_mlp(population=64, eval_episodes=16, generations=3, sigma=1e-2, elite_frac=0.1, grid=10):
-    print(f"\n=== EA SHORT 10x10 MLP: pop={population} eval_eps={eval_episodes} gens={generations} ===")
-    template = DuelingMLP(FEAT_DIM).to(DEVICE)
-    base_flat, shapes = flatten_params(template)
-    dim = base_flat.size
-
-    pop = np.random.randn(population, dim).astype(np.float32) * sigma
-
+def run_ea_short_mlp(grid, ea_n_envs, pop_size=64, generations=2, eval_steps=100, seed=None, base_model=None):
+    if seed is not None:
+        torch.manual_seed(seed); np.random.seed(seed)
+    env = TorchSnakeEnv(n=ea_n_envs, g=grid, max_steps=grid*grid*20, device=DEVICE, seed=seed)
+    base = DuelingMLP(FEAT_DIM).to(DEVICE) if base_model is None else base_model
+    best_model = copy.deepcopy(base)
+    best_score = evaluate_model_on_env(best_model, env, steps_eval=eval_steps)
+    population = []
+    for i in range(pop_size):
+        m = copy.deepcopy(base)
+        for p in m.parameters():
+            p.data.add_(0.01 * torch.randn_like(p))
+        population.append(m)
     for gen in range(generations):
-        print(f"\n-- EA MLP gen {gen + 1}/{generations}")
-        fitness = np.zeros(population, dtype=np.float32)
-        lengths_all = []
-        for i in range(population):
-            f, lengths = evaluate_mlp_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-            fitness[i] = f
-            lengths_all.append(lengths)
-        idx_sorted = np.argsort(-fitness)
-        best_idx = int(idx_sorted[0])
-        best_f = float(fitness[best_idx])
-        mean_f = float(np.mean(fitness))
-        all_lengths = np.concatenate(lengths_all, axis=0)
-        p50 = float(np.median(all_lengths))
-        p90 = float(np.percentile(all_lengths, 90))
-        max_len = int(all_lengths.max())
-        print(f"Gen {gen + 1}: mean_f={mean_f:.4f} best_f={best_f:.4f} median_len={p50:.2f} p90={p90:.2f} max_len={max_len}")
+        scores = []
+        for m in population:
+            s = evaluate_model_on_env(m, env, steps_eval=eval_steps)
+            scores.append(s)
+            if s > best_score:
+                best_score = s
+                best_model = copy.deepcopy(m)
+        idxs = np.argsort(scores)[-2:]
+        parents = [population[i] for i in idxs]
+        new_pop = []
+        for i in range(pop_size):
+            parent = parents[i % 2]
+            child = copy.deepcopy(parent)
+            for p in child.parameters():
+                p.data.add_(0.02 * torch.randn_like(p))
+            new_pop.append(child)
+        population = new_pop
+    return {"best_score": best_score, "model": best_model}
 
-        n_elite = max(1, int(math.ceil(population * elite_frac)))
-        elites = pop[idx_sorted[:n_elite]].copy()
-        offspring = []
-        while len(offspring) < population - n_elite:
-            a, b, c = np.random.choice(population, 3, replace=False)
-            parent = [a, b, c][np.argmax(fitness[[a, b, c]])]
-            child = pop[parent].copy()
-            child += np.random.randn(dim).astype(np.float32) * sigma
-            offspring.append(child)
-        pop = np.vstack([elites] + offspring)[:population]
-        sigma *= 0.99
-
-    fitness = np.zeros(population, dtype=np.float32)
-    for i in range(population):
-        f, _ = evaluate_mlp_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-        fitness[i] = f
-    best_idx = int(np.argmax(fitness))
-    best_flat = pop[best_idx]
-    best_model = DuelingMLP(FEAT_DIM).to(DEVICE)
-    unflatten_to_model(best_model, best_flat, shapes)
-    path = os.path.join(CKPT_DIR, "evo_10x10_mlp.pt")
-    torch.save({"q": best_model.state_dict()}, path)
-    print(f"✅ Saved EA short 10x10 MLP model to {path}")
-    return path
-
-
-# -------------------------
-# EA helpers (CNN)
-# -------------------------
-def evaluate_cnn_individual(flat_weights, shapes, episodes, device, grid, batch_size, random_start=True):
-    model = DuelingCNN(in_channels=3, grid_size=grid).to(device)
-    unflatten_to_model(model, flat_weights, shapes)
-    model.eval()
-
-    max_steps = grid * grid * 50
-    env = TorchSnakeEnv(n=episodes, g=grid, max_steps=max_steps, device=device, random_start=random_start)
-    env.reset().to(device)
-
-    done = torch.zeros(episodes, dtype=torch.bool, device=device)
-    returns = torch.zeros(episodes, device=device)
-
-    while not done.all():
-        grid_obs = env.grid_observation().to(device)
-        with torch.no_grad():
-            qvals = model(grid_obs)
-        acts = qvals.argmax(1)
-        nf, r, d = env.step(acts)
-        returns += r
-        done |= d
-
-    lengths = env.length.cpu().numpy().astype(np.int32)
-    mean_return = float(returns.mean().cpu().numpy())
-    return mean_return, lengths
-
-
-def run_ea_short_10x10_cnn(population=64, eval_episodes=16, generations=3, sigma=1e-2, elite_frac=0.1, grid=10):
-    print(f"\n=== EA SHORT 10x10 CNN: pop={population} eval_eps={eval_episodes} gens={generations} ===")
-    template = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
-    base_flat, shapes = flatten_params(template)
-    dim = base_flat.size
-
-    pop = np.random.randn(population, dim).astype(np.float32) * sigma
-
+def run_ea_short_cnn(grid, ea_n_envs, pop_size=64, generations=2, eval_steps=100, seed=None, base_model=None):
+    if seed is not None:
+        torch.manual_seed(seed); np.random_seed(seed)
+    env = TorchSnakeEnv(n=ea_n_envs, g=grid, max_steps=grid*grid*20, device=DEVICE, seed=seed)
+    base = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE) if base_model is None else base_model
+    best_model = copy.deepcopy(base)
+    best_score = evaluate_model_on_env(best_model, env, steps_eval=eval_steps)
+    population = []
+    for i in range(pop_size):
+        m = copy.deepcopy(base)
+        for p in m.parameters():
+            p.data.add_(0.01 * torch.randn_like(p))
+        population.append(m)
     for gen in range(generations):
-        print(f"\n-- EA CNN gen {gen + 1}/{generations}")
-        fitness = np.zeros(population, dtype=np.float32)
-        lengths_all = []
-        for i in range(population):
-            f, lengths = evaluate_cnn_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-            fitness[i] = f
-            lengths_all.append(lengths)
-        idx_sorted = np.argsort(-fitness)
-        best_idx = int(idx_sorted[0])
-        best_f = float(fitness[best_idx])
-        mean_f = float(np.mean(fitness))
-        all_lengths = np.concatenate(lengths_all, axis=0)
-        p90 = float(np.percentile(all_lengths, 90))
-        max_len = int(all_lengths.max())
-        print(f"Gen {gen + 1}: mean_f={mean_f:.4f} best_f={best_f:.4f} p90_len={p90:.2f} max_len={max_len}")
-
-        n_elite = max(1, int(math.ceil(population * elite_frac)))
-        elites = pop[idx_sorted[:n_elite]].copy()
-        offspring = []
-        while len(offspring) < population - n_elite:
-            a, b, c = np.random.choice(population, 3, replace=False)
-            parent = [a, b, c][np.argmax(fitness[[a, b, c]])]
-            child = pop[parent].copy()
-            child += np.random.randn(dim).astype(np.float32) * sigma
-            offspring.append(child)
-        pop = np.vstack([elites] + offspring)[:population]
-        sigma *= 0.99
-
-    fitness = np.zeros(population, dtype=np.float32)
-    for i in range(population):
-        f, _ = evaluate_cnn_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-        fitness[i] = f
-    best_idx = int(np.argmax(fitness))
-    best_flat = pop[best_idx]
-    best_model = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
-    unflatten_to_model(best_model, best_flat, shapes)
-    path = os.path.join(CKPT_DIR, "evo_10x10_cnn.pt")
-    torch.save({"q": best_model.state_dict()}, path)
-    print(f"✅ Saved EA short 10x10 CNN model to {path}")
-    return path
-
+        scores = []
+        for m in population:
+            s = evaluate_model_on_env(m, env, steps_eval=eval_steps)
+            scores.append(s)
+            if s > best_score:
+                best_score = s
+                best_model = copy.deepcopy(m)
+        idxs = np.argsort(scores)[-2:]
+        parents = [population[i] for i in idxs]
+        new_pop = []
+        for i in range(pop_size):
+            parent = parents[i % 2]
+            child = copy.deepcopy(parent)
+            for p in child.parameters():
+                p.data.add_(0.02 * torch.randn_like(p))
+            new_pop.append(child)
+        population = new_pop
+    return {"best_score": best_score, "model": best_model}
 
 # -------------------------
-# EA from trained models (20x20)
+# Orchestration helpers
 # -------------------------
-def run_ea_20x20_from_mlp(base_ckpt, population=64, eval_episodes=16, generations=3, sigma=5e-3, elite_frac=0.1, grid=20):
-    print(f"\n=== EA 20x20 FROM MLP: base={base_ckpt} ===")
-    base_model = DuelingMLP(FEAT_DIM).to(DEVICE)
-    ckpt = torch.load(base_ckpt, map_location=DEVICE)
-    if "q" in ckpt:
-        base_model.load_state_dict(ckpt["q"])
-    else:
-        base_model.load_state_dict(ckpt)
-    base_flat, shapes = flatten_params(base_model)
-    dim = base_flat.size
+def write_csv(path, rows, keys):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in keys})
+    os.replace(tmp, path)
 
-    pop = np.tile(base_flat, (population, 1))
-    pop += np.random.randn(population, dim).astype(np.float32) * sigma
+def _norm(x, lo, hi):
+    if hi <= lo:
+        return 0.0
+    return (x - lo) / (hi - lo)
 
-    for gen in range(generations):
-        print(f"\n-- EA 20x20 MLP gen {gen + 1}/{generations}")
-        fitness = np.zeros(population, dtype=np.float32)
-        for i in range(population):
-            f, _ = evaluate_mlp_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-            fitness[i] = f
-        idx_sorted = np.argsort(-fitness)
-        best_idx = int(idx_sorted[0])
-        best_f = float(fitness[best_idx])
-        mean_f = float(np.mean(fitness))
-        print(f"Gen {gen + 1}: mean_f={mean_f:.4f} best_f={best_f:.4f}")
-
-        n_elite = max(1, int(math.ceil(population * elite_frac)))
-        elites = pop[idx_sorted[:n_elite]].copy()
-        offspring = []
-        while len(offspring) < population - n_elite:
-            a, b, c = np.random.choice(population, 3, replace=False)
-            parent = [a, b, c][np.argmax(fitness[[a, b, c]])]
-            child = pop[parent].copy()
-            child += np.random.randn(dim).astype(np.float32) * sigma
-            offspring.append(child)
-        pop = np.vstack([elites] + offspring)[:population]
-        sigma *= 0.99
-
-    fitness = np.zeros(population, dtype=np.float32)
-    for i in range(population):
-        f, _ = evaluate_mlp_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-        fitness[i] = f
-    best_idx = int(np.argmax(fitness))
-    best_flat = pop[best_idx]
-    best_model = DuelingMLP(FEAT_DIM).to(DEVICE)
-    unflatten_to_model(best_model, best_flat, shapes)
-    path = os.path.join(CKPT_DIR, "evo_20x20_from_mlp.pt")
-    torch.save({"q": best_model.state_dict()}, path)
-    print(f"✅ Saved EA 20x20 from MLP model to {path}")
-    return path
-
-
-def run_ea_20x20_from_cnn(base_ckpt, population=64, eval_episodes=16, generations=3, sigma=5e-3, elite_frac=0.1, grid=20):
-    print(f"\n=== EA 20x20 FROM CNN: base={base_ckpt} ===")
-    base_model = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
-    ckpt = torch.load(base_ckpt, map_location=DEVICE)
-    if "q" in ckpt:
-        base_model.load_state_dict(ckpt["q"])
-    else:
-        base_model.load_state_dict(ckpt)
-    base_flat, shapes = flatten_params(base_model)
-    dim = base_flat.size
-
-    pop = np.tile(base_flat, (population, 1))
-    pop += np.random.randn(population, dim).astype(np.float32) * sigma
-
-    for gen in range(generations):
-        print(f"\n-- EA 20x20 CNN gen {gen + 1}/{generations}")
-        fitness = np.zeros(population, dtype=np.float32)
-        for i in range(population):
-            f, _ = evaluate_cnn_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-            fitness[i] = f
-        idx_sorted = np.argsort(-fitness)
-        best_idx = int(idx_sorted[0])
-        best_f = float(fitness[best_idx])
-        mean_f = float(np.mean(fitness))
-        print(f"Gen {gen + 1}: mean_f={mean_f:.4f} best_f={best_f:.4f}")
-
-        n_elite = max(1, int(math.ceil(population * elite_frac)))
-        elites = pop[idx_sorted[:n_elite]].copy()
-        offspring = []
-        while len(offspring) < population - n_elite:
-            a, b, c = np.random.choice(population, 3, replace=False)
-            parent = [a, b, c][np.argmax(fitness[[a, b, c]])]
-            child = pop[parent].copy()
-            child += np.random.randn(dim).astype(np.float32) * sigma
-            offspring.append(child)
-        pop = np.vstack([elites] + offspring)[:population]
-        sigma *= 0.99
-
-    fitness = np.zeros(population, dtype=np.float32)
-    for i in range(population):
-        f, _ = evaluate_cnn_individual(pop[i], shapes, eval_episodes, DEVICE, grid, BATCH)
-        fitness[i] = f
-    best_idx = int(np.argmax(fitness))
-    best_flat = pop[best_idx]
-    best_model = DuelingCNN(in_channels=3, grid_size=grid).to(DEVICE)
-    unflatten_to_model(best_model, best_flat, shapes)
-    path = os.path.join(CKPT_DIR, "evo_20x20_from_cnn.pt")
-    torch.save({"q": best_model.state_dict()}, path)
-    print(f"✅ Saved EA 20x20 from CNN model to {path}")
-    return path
-
-
-# -------------------------
-# For app.py: QNet + valid_action_mask
-# -------------------------
-class QNet(DuelingCNN):
-    def __init__(self, grid_size=20):
-        super().__init__(in_channels=3, grid_size=grid_size)
-
-
-def valid_action_mask(env):
-    # all actions valid in this env
-    return torch.ones(1, ACTIONS, dtype=torch.bool, device=env.device)
-
-
-# -------------------------
-# Orchestrator
-# -------------------------
-def main():
-    # 1) 10x10 evolutionary short test (MLP)
-    evo_10_mlp = run_ea_short_10x10_mlp()
-
-    # 2) 10x10 evolutionary short test (CNN)
-    evo_10_cnn = run_ea_short_10x10_cnn()
-
-    # 3) 10x10 MLP
-    mlp_10 = train_mlp(
-        grid=10,
-        steps=20_000,
-        ckpt_path=os.path.join(CKPT_DIR, "mlp_10x10.pt"),
-        load=evo_10_mlp,
-        n_envs=2048,
+def weighted_score(it_s, p90, p50, mean_td, stats):
+    it_s_n = _norm(it_s, stats["it_s_min"], stats["it_s_max"])
+    p90_n  = _norm(p90,  stats["p90_min"],  stats["p90_max"])
+    p50_n  = _norm(p50,  stats["p50_min"],  stats["p50_max"])
+    td_n   = _norm(mean_td, stats["td_min"], stats["td_max"])
+    return (
+        0.50 * it_s_n +
+        0.30 * p90_n +
+        0.15 * p50_n +
+        0.05 * (1.0 - td_n)
     )
 
-    # 4) 20x20 MLP
-    mlp_20 = train_mlp(
-        grid=20,
-        steps=80_000,
-        ckpt_path=os.path.join(CKPT_DIR, "mlp_20x20.pt"),
-        load=mlp_10,
-        n_envs=4096,
-    )
+def evaluate_training_grid_auto(model_type, grid):
+    rows = []
+    agg_rows = []
+    pairs = [(B, E) for B in TRAIN_BATCHES for E in TRAIN_ENVS]
 
-    # 5) 10x10 CNN
-    cnn_10 = train_cnn(
-        grid=10,
-        steps=20_000,
-        ckpt_path=os.path.join(CKPT_DIR, "cnn_10x10.pt"),
-        load=evo_10_cnn,
-        n_envs=2048,
-    )
+    # Run all configs with repeats, save tmp checkpoints into benchmarks/
+    for B, E in pairs:
+        run_metrics = []
+        for r in range(REPEATS):
+            seed_run = int(time.time()) % (2**31)
+            print(f"\nAuto-run {model_type.upper()} B={B} E={E} repeat={r+1}/{REPEATS}")
+            ckpt = os.path.join(BENCH_DIR, f"tmp_{model_type}_g{grid}_B{B}_E{E}_r{r}.pt")
+            try:
+                if model_type == "mlp":
+                    m = train_mlp(grid=grid, steps=SHORT_STEPS, ckpt_path=ckpt,
+                                  batch_size=B, n_envs=E, seed=seed_run)
+                else:
+                    m = train_cnn(grid=grid, steps=SHORT_STEPS, ckpt_path=ckpt,
+                                  batch_size=B, n_envs=E, seed=seed_run)
+            except Exception as ex:
+                print("Benchmark run failed:", ex)
+                m = {"it_per_s": 0.0, "final_p90": 0.0, "final_p50": 0.0,
+                     "final_p10": 0.0, "final_max": 0.0, "mean_td": float("nan")}
+            row = {
+                "model": model_type,
+                "grid": grid,
+                "batch": B,
+                "n_envs": E,
+                "repeat": r,
+                "it_per_s": m["it_per_s"],
+                "final_p90": m["final_p90"],
+                "final_p50": m["final_p50"],
+                "final_p10": m["final_p10"],
+                "final_max": m["final_max"],
+                "mean_td": m["mean_td"],
+            }
+            rows.append(row)
+            run_metrics.append(m)
 
-    # 6) 20x20 CNN
-    cnn_20 = train_cnn(
-        grid=20,
-        steps=80_000,
-        ckpt_path=os.path.join(CKPT_DIR, "cnn_20x20.pt"),
-        load=cnn_10,
-        n_envs=4096,
-    )
+        # Aggregate per (B,E)
+        it_list = [rm["it_per_s"] for rm in run_metrics]
+        p90_list = [rm["final_p90"] for rm in run_metrics]
+        p50_list = [rm["final_p50"] for rm in run_metrics]
+        td_list = [rm["mean_td"] for rm in run_metrics if not math.isnan(rm["mean_td"])]
 
-    # 7) 20x20 evolutionary from MLP
-    run_ea_20x20_from_mlp(base_ckpt=mlp_20)
+        agg_rows.append({
+            "model": model_type,
+            "grid": grid,
+            "batch": B,
+            "n_envs": E,
+            "it_per_s_med": median(it_list) if it_list else 0.0,
+            "final_p90_med": median(p90_list) if p90_list else 0.0,
+            "final_p50_med": median(p50_list) if p50_list else 0.0,
+            "mean_td_med": median(td_list) if td_list else float("nan"),
+        })
 
-    # 8) 20x20 evolutionary from CNN
-    run_ea_20x20_from_cnn(base_ckpt=cnn_20)
+    # Save raw benchmark CSV
+    raw_keys = ["model", "grid", "batch", "n_envs", "repeat",
+                "it_per_s", "final_p90", "final_p50", "final_p10", "final_max", "mean_td"]
+    raw_path = os.path.join(BENCH_DIR, f"bench_{model_type}_g{grid}_raw.csv")
+    write_csv(raw_path, rows, raw_keys)
 
-    print("\nAll runs complete.")
+    # Compute stats for normalization
+    it_vals = [r["it_per_s_med"] for r in agg_rows]
+    p90_vals = [r["final_p90_med"] for r in agg_rows]
+    p50_vals = [r["final_p50_med"] for r in agg_rows]
+    td_vals = [r["mean_td_med"] for r in agg_rows if not math.isnan(r["mean_td_med"])]
 
+    stats = {
+        "it_s_min": min(it_vals) if it_vals else 0.0,
+        "it_s_max": max(it_vals) if it_vals else 1.0,
+        "p90_min": min(p90_vals) if p90_vals else 0.0,
+        "p90_max": max(p90_vals) if p90_vals else 1.0,
+        "p50_min": min(p50_vals) if p50_vals else 0.0,
+        "p50_max": max(p50_vals) if p50_vals else 1.0,
+        "td_min": min(td_vals) if td_vals else 0.0,
+        "td_max": max(td_vals) if td_vals else 1.0,
+    }
+
+    # Compute weighted scores and pick best
+    best_cfg = None
+    best_score = -1e9
+    for r in agg_rows:
+        score = weighted_score(
+            r["it_per_s_med"],
+            r["final_p90_med"],
+            r["final_p50_med"],
+            r["mean_td_med"] if not math.isnan(r["mean_td_med"]) else stats["td_max"],
+            stats,
+        )
+        r["score"] = score
+        if score > best_score:
+            best_score = score
+            best_cfg = r
+
+    # Save aggregated CSV
+    agg_keys = ["model", "grid", "batch", "n_envs",
+                "it_per_s_med", "final_p90_med", "final_p50_med", "mean_td_med", "score"]
+    agg_path = os.path.join(BENCH_DIR, f"bench_{model_type}_g{grid}_agg.csv")
+    write_csv(agg_path, agg_rows, agg_keys)
+
+    print(f"\nBest training config for {model_type.upper()} on grid {grid}: "
+          f"batch={best_cfg['batch']} n_envs={best_cfg['n_envs']} score={best_cfg['score']:.4f}")
+
+    return best_cfg
+
+def evaluate_ea_grid_auto(model_type, grid):
+    rows = []
+    agg_rows = []
+    pairs = [(p, e) for p in EA_POP_SIZES for e in EA_ENVS]
+
+    for pop_size, ea_envs in pairs:
+        run_scores = []
+        for r in range(REPEATS):
+            seed_run = int(time.time()) % (2**31)
+            print(f"\nEA auto-run {model_type.upper()} pop={pop_size} ea_envs={ea_envs} repeat={r+1}/{REPEATS}")
+            try:
+                if model_type == "mlp":
+                    res = run_ea_short_mlp(grid=grid, ea_n_envs=ea_envs,
+                                           pop_size=pop_size, generations=EA_GENERATIONS,
+                                           eval_steps=EA_EVAL_STEPS, seed=seed_run)
+                else:
+                    res = run_ea_short_cnn(grid=grid, ea_n_envs=ea_envs,
+                                           pop_size=pop_size, generations=EA_GENERATIONS,
+                                           eval_steps=EA_EVAL_STEPS, seed=seed_run)
+                score = res["best_score"]
+            except Exception as ex:
+                print("EA benchmark failed:", ex)
+                score = 0.0
+            rows.append({
+                "model": model_type,
+                "grid": grid,
+                "pop_size": pop_size,
+                "ea_envs": ea_envs,
+                "repeat": r,
+                "best_score": score,
+            })
+            run_scores.append(score)
+
+        agg_rows.append({
+            "model": model_type,
+            "grid": grid,
+            "pop_size": pop_size,
+            "ea_envs": ea_envs,
+            "best_score_med": median(run_scores) if run_scores else 0.0,
+        })
+
+    # Save EA raw CSV
+    raw_keys = ["model", "grid", "pop_size", "ea_envs", "repeat", "best_score"]
+    raw_path = os.path.join(BENCH_DIR, f"ea_{model_type}_g{grid}_raw.csv")
+    write_csv(raw_path, rows, raw_keys)
+
+    # Pick best EA config by median score
+    best_cfg = None
+    best_score = -1e9
+    for r in agg_rows:
+        if r["best_score_med"] > best_score:
+            best_score = r["best_score_med"]
+            best_cfg = r
+
+    # Save EA aggregated CSV
+    agg_keys = ["model", "grid", "pop_size", "ea_envs", "best_score_med"]
+    agg_path = os.path.join(BENCH_DIR, f"ea_{model_type}_g{grid}_agg.csv")
+    write_csv(agg_path, agg_rows, agg_keys)
+
+    print(f"\nBest EA config for {model_type.upper()} on grid {grid}: "
+          f"pop_size={best_cfg['pop_size']} ea_envs={best_cfg['ea_envs']} "
+          f"median_score={best_cfg['best_score_med']:.4f}")
+
+    return best_cfg
+
+# -------------------------
+# Main orchestration
+# -------------------------
+def main_auto():
+    grid = 10  # fixed grid size for now
+
+    for model in ["mlp", "cnn"]:
+        print(f"\n================ {model.upper()} AUTO-BENCHMARK ================")
+        bt = evaluate_training_grid_auto(model, grid)
+        be = evaluate_ea_grid_auto(model, grid)
+
+        B = int(bt["batch"])
+        E = int(bt["n_envs"])
+        print(f"\n--- Final training for {model.upper()} with batch={B}, envs={E} ---")
+        ckpt_final = os.path.join(CKPT_DIR, f"final_{model}_g{grid}_B{B}_E{E}.pt")
+        try:
+            if model == "mlp":
+                train_mlp(grid=grid, steps=max(2000, SHORT_STEPS * 2),
+                          ckpt_path=ckpt_final, batch_size=B, n_envs=E)
+            else:
+                train_cnn(grid=grid, steps=max(2000, SHORT_STEPS * 2),
+                          ckpt_path=ckpt_final, batch_size=B, n_envs=E)
+        except Exception as ex:
+            print("Final training failed:", ex)
+
+        pop_size = int(be["pop_size"])
+        ea_envs = int(be["ea_envs"])
+        print(f"\n--- Final EA for {model.upper()} pop={pop_size} ea_envs={ea_envs} ---")
+        try:
+            if model == "mlp":
+                res = run_ea_short_mlp(grid=grid, ea_n_envs=ea_envs, pop_size=pop_size,
+                                       generations=EA_GENERATIONS, eval_steps=EA_EVAL_STEPS)
+            else:
+                res = run_ea_short_cnn(grid=grid, ea_n_envs=ea_envs, pop_size=pop_size,
+                                       generations=EA_GENERATIONS, eval_steps=EA_EVAL_STEPS)
+            print("Final EA best score:", res["best_score"])
+
+            # Save final EA model checkpoint for app.py-style loading
+            ea_name = f"evo_{grid}x{grid}_from_{model}.pt"
+            ea_path = os.path.join(CKPT_DIR, ea_name)
+            torch.save({"q": res["model"].state_dict()}, ea_path)
+            print(f"Saved final EA model to {ea_path}")
+        except Exception as ex:
+            print("Final EA failed:", ex)
+
+    print("\nAll done. Benchmarks are in benchmarks/ and final checkpoints are in saved_models/.")
 
 if __name__ == "__main__":
-    main()
+    main_auto()
