@@ -1,129 +1,233 @@
-# Snake Deep Q-Learning Agent
+# SnakeGeneration
 
-A Python implementation of a Snake environment using Gymnasium and a deep Q-learning agent with PyTorch. This repo offers flexible training, a GUI for testing, and both detailed technical settings and practical quick-start instructions.
-
----
-
-## Quick Start
-
-1. **Create a virtual environment & install dependencies:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements
-   ```
-2. **Train a new model (optional):**
-   ```bash
-   python main.py
-   ```
-   - Models are saved in `saved_models/`, along with training curves.
-3. **Or use the GUI application with the included pretrained model:**
-   ```bash
-   python app.py
-   ```
-   - Select your model file and grid size to watch the AI play!
+SnakeGeneration is a reinforcement learning project for training and comparing Snake agents built with **PyTorch**. The repository includes an optimized vectorized Snake environment, multiple Q-network architectures, training utilities, benchmarking helpers, and a Pygame viewer for visualizing trained models and exporting comparison GIFs.
 
 ---
 
-## Technical Details
+## Demo
 
-### Environment (`snake_gym_env.py`)
-- **Action space:** 4 discrete (0=right, 1=up, 2=left, 3=down)
-- **Observation space:**  
-  - `coords`: Body positions (head, rest padded with (-1,-1)), and fruit coordinates
-  - `features`:  
-    - Head x/y (normalized)
-    - Fruit relative x/y (normalized)
-    - Heading (x, y direction)
-    - Danger ahead, left, right (1 if collision, else 0)
-- **Reward function:**
-  - +1 on eating fruit
-  - -1 on collision (terminal)
-  - +0.05 for getting closer to fruit
-  - -0.05 for getting farther from fruit
-  - -0.001 per time step
-- **Fruit is never spawned on the snake's body.**
+### Single run comparison
 
+This GIF shows a live-style multi-model comparison in a single run.
 
-### Sample Feature Extraction Code
-```python
-def _coords_to_features(self, coords: np.ndarray) -> np.ndarray:
-    # ...details...
-    return np.array([
-        head[0] / denom,
-        head[1] / denom,
-        dx / denom,
-        dy / denom,
-        hx, hy,
-        danger(*front),
-        danger(*left),
-        danger(*right)
-    ], dtype=np.float32)
+![Single run comparison](assets/all_models.gif)
+
+### Best run during 10 minutes
+
+This GIF shows the best recorded run for each model during a 10-minute collection window.
+
+![Best run during 10 minutes](assets/all_models_best_runs.gif)
+
+---
+
+## Features
+
+- **Multiple model types**
+  - Dueling **MLP**
+  - Dueling **CNN**
+  - Dueling **C51-CNN**
+- **Fast vectorized environment** implemented in `env_fast.py`
+- **Training utilities** in `trainer.py`
+- **Model comparison viewer** in `app.py`
+- **Benchmark support** in `benchmark.py`
+- **Saved model loading** from `saved_models/`
+- **Custom Snake graphics** from `Graphics/` / `graphics/`
+
+---
+
+## Project Structure
+
+```text
+.
+├── .gitignore
+├── assets/
+│   ├── all_models.gif
+│   └── all_models_best_runs.gif
+├── Font/
+│   └── PoetsenOne-Regular.ttf
+├── Graphics/
+│   ├── apple.png
+│   ├── body_bl.png
+│   ├── body_br.png
+│   ├── body_horizontal.png
+│   ├── body_tl.png
+│   ├── body_tr.png
+│   ├── body_vertical.png
+│   ├── head_down.png
+│   ├── head_left.png
+│   ├── head_right.png
+│   ├── head_up.png
+│   ├── tail_down.png
+│   ├── tail_left.png
+│   ├── tail_right.png
+│   └── tail_up.png
+├── saved_models/
+│   └── *.pt
+├── app.py
+├── benchmark.py
+├── env_fast.py
+├── main.py
+├── models.py
+└── trainer.py
 ```
-- Where `danger` returns 1.0 if moving to the tested position would cause a collision.
-
----
-
-## Training (main.py)
-
-- **Optimizer:** `Adam` (default lr=1e-4)
-- **Loss:** `SmoothL1Loss`
-- **Replay buffer:** size 50,000
-- **Discount factor:** γ = 0.99
-- **Batch size:** 256
-- **Target network update:** every 1000 steps
-- **Epsilon-greedy schedule:**  
-  - eps_start = 1, eps_end = 0.05, eps_decay_steps = 200,000
-
-- **Supports multi-environment training:**  
-  Default n_envs=8 in parallel (vectorized).
-
----
-
-## Example Training Call
-
-```python
-train_model(
-    grid_size=20,
-    episodes=2000,
-    learning_rate=1e-4,
-    batch_size=256,
-    seed=42,
-    n_envs=8,
-    save_dir="saved_models"
-)
-```
-
----
-
-## File Structure
-
-- `main.py` — Training loop, model, evaluation
-- `app.py` — GUI to visualize or manually play
-- `snake_gym_env.py` — Gymnasium environment (core rules & obs)
-- `saved_models/` — Pretrained and user-trained weights (e.g., `best_snake_grid20.pt`)
-- `Graphics/`, `Sound/`, `Font/` — Art assets
 
 ---
 
 ## Requirements
 
-- Python 3.8+
-- PyTorch >= 1.12.0
-- Gymnasium == 1.2.0
-- Pygame == 2.6.1
-- NumPy, Matplotlib, Pillow
+Recommended:
+
+- Python **3.10+**
+- `torch`
+- `numpy`
+- `pygame`
+- `imageio`
+
+If you have a `requirements.txt`, install everything with:
+
+```bash
+pip install -r requirements.txt
+```
+
+Otherwise, install the core packages manually:
+
+```bash
+pip install torch numpy pygame imageio
+```
 
 ---
 
-## Troubleshooting
+## Installation
 
-- All errors usually result from missing dependencies or missing asset files.
-- On Linux, for GUI, install Tkinter:  
-  `sudo apt-get install python3-tk`
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/Pawel-Sokolowski/SnakeGeneration.git
+cd SnakeGeneration
+```
+
+Create and activate a virtual environment (recommended):
+
+### Windows
+
+```bash
+python -m venv venv
+.\venv\Scripts\activate
+```
+
+### macOS / Linux
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+Then install dependencies.
+
+---
+
+## Usage
+
+### Train models
+
+Use `main.py` to train agents.
+
+```bash
+python main.py
+```
+
+If your training script supports command-line arguments, you can run the relevant mode or configuration for:
+
+- MLP training
+- CNN training
+- C51-CNN training
+- evolutionary / benchmark workflows
+
+---
+
+### View trained models
+
+Use the viewer to load every `.pt` file from `saved_models/` and compare them side by side:
+
+```bash
+python app.py
+```
+
+Depending on your current `app.py` version, it can:
+
+- visualize multiple trained models in a grid,
+- render custom snake graphics,
+- export a single-run comparison GIF,
+- export a “best run during 10 minutes” comparison GIF.
+
+---
+
+### Benchmark
+
+If you use the benchmark helper:
+
+```bash
+python benchmark.py
+```
+
+or, depending on your workflow:
+
+```bash
+python main.py benchmark
+```
+
+---
+
+## Model Types
+
+The repository currently includes the following model classes in `models.py`:
+
+- `DuelingMLP`
+- `DuelingCNN`
+- `DuelingC51CNN`
+
+These are used by the training pipeline and by the visualization app when loading `.pt` checkpoints.
+
+---
+
+## Saved Models
+
+Trained checkpoints are expected in:
+
+```text
+saved_models/
+```
+
+Example filenames:
+
+- `cnn_10x10.pt`
+- `c51_cnn_10x10.pt`
+- `ea_g20_from_mlp_20x20_seed_mlp_10x10_mlp.pt`
+
+The viewer formats these names automatically for display in the comparison grid.
+
+---
+
+## Notes
+
+- The app expects Snake sprites in either `Graphics/` or `graphics/`.
+- The generated demo GIFs are stored in `assets/`.
+- If a model file is missing or incompatible, the corresponding load step will fail.
+
+---
+
+## Contributing
+
+Contributions are welcome. If you want to improve training, visualization, model architectures, or documentation:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Open a pull request
 
 ---
 
 ## License
 
-Provided for educational and research purposes.
+This repository currently does not declare a license in the provided project structure.
+If you plan to make the project open source for broader reuse, adding a license file is strongly recommended.
