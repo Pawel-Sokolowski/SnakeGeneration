@@ -7,10 +7,10 @@ import pygame
 import torch
 import numpy as np
 import imageio
-from PIL import Image
 
 from env_fast import TorchSnakeEnv
 from models import DuelingMLP, DuelingCNN, DuelingC51CNN
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,13 +40,19 @@ PANEL_BG = (34, 52, 28)
 PANEL_BORDER = (70, 95, 55)
 HEADER_BG = (45, 70, 35)
 
-# Best-run collection phase length
-RUN_SECONDS = 10 * 60
+# Timed best-run collection lengths
+RUN_SECONDS_10MIN = 10 * 60
+RUN_SECONDS_1H = 60 * 60
+
+# Shared seed for fair single-run comparison
+FIXED_COMPARE_SEED = 1337
 
 # VIDEO output
 OUTPUT_DIR = "assets"
 VIDEO_ALL_DIE_PATH = os.path.join(OUTPUT_DIR, "all_models_until_all_dead.mp4")
-VIDEO_BEST_GRID_PATH = os.path.join(OUTPUT_DIR, "all_models_best_10min_grid.mp4")
+VIDEO_BEST_10MIN_GRID_PATH = os.path.join(OUTPUT_DIR, "all_models_best_10min_grid.mp4")
+VIDEO_BEST_1H_GRID_PATH = os.path.join(OUTPUT_DIR, "all_models_best_1hour_grid.mp4")
+VIDEO_FIXED_SEED_COMPARE_PATH = os.path.join(OUTPUT_DIR, "all_models_fixed_seed_compare.mp4")
 
 # Capture every Nth frame
 CAPTURE_EVERY = 2
@@ -318,12 +324,10 @@ def draw_action_arrow(surf, direction_abs, center, size=16, color=(255, 255, 255
     else:
         return
 
-    # outline
     pygame.draw.line(surf, outline, start, end, width + 2)
     pygame.draw.line(surf, outline, end, head1, width + 2)
     pygame.draw.line(surf, outline, end, head2, width + 2)
 
-    # inner arrow
     pygame.draw.line(surf, color, start, end, width)
     pygame.draw.line(surf, color, end, head1, width)
     pygame.draw.line(surf, color, end, head2, width)
@@ -350,7 +354,7 @@ def relative_action_to_absolute_dir(prev_dir: int, rel_action: int) -> int:
 # VIEWER / EPISODE TRACKER
 # =========================
 class Viewer:
-    def __init__(self, entry):
+    def __init__(self, entry, initial_seed=None):
         self.name, self.path, self.kind = entry
         self.display_name = format_model_name(self.name)
 
@@ -366,16 +370,21 @@ class Viewer:
         self.last_action_relative = None   # 0=straight, 1=left, 2=right
         self.last_move_direction = None    # 0=right, 1=down, 2=left, 3=up
 
-        self.env = TorchSnakeEnv(
+        self.initial_seed = initial_seed
+        self.env = self.make_env(seed=initial_seed)
+
+        self.load_model()
+        self.begin_new_episode()
+
+    def make_env(self, seed=None):
+        return TorchSnakeEnv(
             n=1,
             g=GRID_SIZE,
             max_steps=GRID_SIZE ** 2 * 50,
             device=device,
             random_start=True,
+            seed=seed,
         )
-
-        self.load_model()
-        self.begin_new_episode()
 
     def load_model(self):
         ckpt = torch.load(self.path, map_location=device)
@@ -407,7 +416,14 @@ class Viewer:
         self.last_move_direction = None
 
     def restart_episode(self):
-        obs = self.env.reset().to(device)
+        # Timed best-run collection remains stochastic on purpose.
+        # Recreate env only if an explicit initial seed was requested for single-run compare.
+        if self.initial_seed is not None:
+            self.env = self.make_env(seed=self.initial_seed)
+            obs = self.env.reset().to(device)
+        else:
+            obs = self.env.reset().to(device)
+
         if self.kind == "mlp":
             self.stack = [obs.clone() for _ in range(3)]
         self.begin_new_episode()
@@ -430,7 +446,7 @@ class Viewer:
 
             action = q.argmax(1)
 
-            # IMPORTANT: models output RELATIVE actions:
+            # models output RELATIVE actions:
             #   0 = straight, 1 = left, 2 = right
             self.last_action_relative = int(action.item())
 
@@ -672,7 +688,7 @@ def save_video_from_rgb_frames(frames, video_path, hold_frames=FINAL_HOLD_FRAMES
         pixelformat="yuv420p",
         macro_block_size=1,
         ffmpeg_params=[
-            "-crf", "28",          # higher = smaller, lower = better quality
+            "-crf", "28",
             "-preset", "medium",
             "-movflags", "+faststart",
         ],
@@ -751,12 +767,9 @@ def render_viewers(screen, viewers, font, small_font, status_text):
     return panel_surfaces
 
 
-def collect_grid_until_all_dead(screen, viewers, font, small_font, clock):
+def collect_grid_until_all_dead(screen, viewers, font, small_font, clock, status_text="Phase 1/4: recording until all models die..."):
     """
-    Phase 1:
-    - start all models once
-    - never restart
-    - record the 5x2 grid until all models are dead
+    Start all models once, never restart, and record the grid until all models are dead.
     """
     grid_frames = []
     frame_count = 0
@@ -770,14 +783,7 @@ def collect_grid_until_all_dead(screen, viewers, font, small_font, clock):
         for v in viewers:
             v.step()
 
-        panel_surfaces = render_viewers(
-            screen,
-            viewers,
-            font,
-            small_font,
-            "Phase 1/2: recording until all models die..."
-        )
-
+        panel_surfaces = render_viewers(screen, viewers, font, small_font, status_text)
         clock.tick(FPS)
 
         if frame_count % CAPTURE_EVERY == 0:
@@ -793,9 +799,9 @@ def collect_grid_until_all_dead(screen, viewers, font, small_font, clock):
     return grid_frames, True
 
 
-def collect_best_runs_for_duration(screen, viewers, font, small_font, clock, run_seconds):
+def collect_best_runs_for_duration(screen, viewers, font, small_font, clock, run_seconds, phase_label="best episodes"):
     """
-    Phase 2:
+    Timed phase:
     - run for N seconds
     - restart models during timed collection
     - once time expires:
@@ -819,7 +825,7 @@ def collect_best_runs_for_duration(screen, viewers, font, small_font, clock, run
 
         if timed_phase and elapsed >= run_seconds:
             timed_phase = False
-            print("Time limit reached. Waiting for currently running episodes to finish...")
+            print(f"Time limit reached for {phase_label}. Waiting for currently running episodes to finish...")
 
         dead_this_frame = []
         for v in viewers:
@@ -830,19 +836,12 @@ def collect_best_runs_for_duration(screen, viewers, font, small_font, clock, run
             remaining = max(0, int(run_seconds - elapsed))
             mins = remaining // 60
             secs = remaining % 60
-            status_text = f"Phase 2/2: collecting best episodes... {mins:02d}:{secs:02d} remaining"
+            status_text = f"{phase_label}: collecting best episodes... {mins:02d}:{secs:02d} remaining"
         else:
             alive_count = sum(not v.dead for v in viewers)
-            status_text = f"Phase 2/2: finishing active episodes... alive: {alive_count}"
+            status_text = f"{phase_label}: finishing active episodes... alive: {alive_count}"
 
-        panel_surfaces = render_viewers(
-            screen,
-            viewers,
-            font,
-            small_font,
-            status_text
-        )
-
+        panel_surfaces = render_viewers(screen, viewers, font, small_font, status_text)
         clock.tick(FPS)
 
         if frame_count % CAPTURE_EVERY == 0:
@@ -915,11 +914,16 @@ def main():
     print(f"Grid layout: {COLS}x{ROWS}")
 
     # -------------------------
-    # PHASE 1: run until all die
+    # PHASE 1: random single run until all die
     # -------------------------
     viewers_phase1 = [Viewer(m) for m in MODELS]
     phase1_frames, continue_after_phase1 = collect_grid_until_all_dead(
-        screen, viewers_phase1, font, small_font, clock
+        screen,
+        viewers_phase1,
+        font,
+        small_font,
+        clock,
+        status_text="Phase 1/4: random single run until all models die..."
     )
     save_video_from_rgb_frames(phase1_frames, VIDEO_ALL_DIE_PATH)
 
@@ -929,22 +933,80 @@ def main():
         return
 
     # -------------------------
-    # PHASE 2: 10 minutes + graceful finish
+    # PHASE 2: 10-minute best runs
     # -------------------------
     viewers_phase2 = [Viewer(m) for m in MODELS]
     completed_phase2 = collect_best_runs_for_duration(
-        screen, viewers_phase2, font, small_font, clock, RUN_SECONDS
+        screen,
+        viewers_phase2,
+        font,
+        small_font,
+        clock,
+        RUN_SECONDS_10MIN,
+        phase_label="Phase 2/4 (10 min best runs)"
     )
 
-    best_grid_frames = build_best_grid_frames(viewers_phase2)
-    save_video_from_rgb_frames(best_grid_frames, VIDEO_BEST_GRID_PATH)
+    best_grid_10min_frames = build_best_grid_frames(viewers_phase2)
+    save_video_from_rgb_frames(best_grid_10min_frames, VIDEO_BEST_10MIN_GRID_PATH)
 
-    print("\nBest episode scores:")
+    print("\nBest episode scores (10 minutes):")
     for v in viewers_phase2:
         print(f"{v.display_name}: {v.best_episode_score}")
 
     if not completed_phase2:
         print("Window closed during phase 2.")
+        pygame.quit()
+        return
+
+    # -------------------------
+    # PHASE 3: 1-hour best runs
+    # -------------------------
+    viewers_phase3 = [Viewer(m) for m in MODELS]
+    completed_phase3 = collect_best_runs_for_duration(
+        screen,
+        viewers_phase3,
+        font,
+        small_font,
+        clock,
+        RUN_SECONDS_1H,
+        phase_label="Phase 3/4 (1 hour best runs)"
+    )
+
+    best_grid_1h_frames = build_best_grid_frames(viewers_phase3)
+    save_video_from_rgb_frames(best_grid_1h_frames, VIDEO_BEST_1H_GRID_PATH)
+
+    print("\nBest episode scores (1 hour):")
+    for v in viewers_phase3:
+        print(f"{v.display_name}: {v.best_episode_score}")
+
+    if not completed_phase3:
+        print("Window closed during phase 3.")
+        pygame.quit()
+        return
+
+    # -------------------------
+    # PHASE 4: fixed-seed single comparison
+    # -------------------------
+    viewers_phase4 = [Viewer(m, initial_seed=FIXED_COMPARE_SEED) for m in MODELS]
+    phase4_frames, continue_after_phase4 = collect_grid_until_all_dead(
+        screen,
+        viewers_phase4,
+        font,
+        small_font,
+        clock,
+        status_text=f"Phase 4/4: fixed-seed comparison (seed={FIXED_COMPARE_SEED}) until all models die..."
+    )
+    save_video_from_rgb_frames(phase4_frames, VIDEO_FIXED_SEED_COMPARE_PATH)
+
+    if not continue_after_phase4:
+        print("Window closed during phase 4.")
+
+    print("\nDone.")
+    print("Generated:")
+    print(f"- {VIDEO_ALL_DIE_PATH}")
+    print(f"- {VIDEO_BEST_10MIN_GRID_PATH}")
+    print(f"- {VIDEO_BEST_1H_GRID_PATH}")
+    print(f"- {VIDEO_FIXED_SEED_COMPARE_PATH}")
 
     pygame.quit()
 

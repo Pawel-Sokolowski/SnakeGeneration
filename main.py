@@ -291,13 +291,10 @@ if __name__ == "__main__":
 
     ap.add_argument("--log-every", type=int, default=1000)
     ap.add_argument("--curiosity-every", type=int, default=1)
-
-    # NEW:
     ap.add_argument("--ea-parallel", action="store_true", help="Run EA batches in parallel (uses spawn). Default is sequential (recommended on 1 GPU).")
 
     args = ap.parse_args()
 
-    # NOTE: do NOT force global spawn here; we only use spawn context for EA.
     run_pipeline(
         train_batches=_parse_int_list(args.train_batches),
         train_envs=_parse_int_list(args.train_envs),
