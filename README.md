@@ -10,13 +10,13 @@ SnakeGeneration is a reinforcement learning project for training and comparing S
 
 This GIF shows a live-style multi-model comparison in a single run.
 
-![Single run comparison](assets/all_models.gif)
+![Single run comparison](assets/all_models_until_all_dead.gif)
 
 ### Best run during 10 minutes
 
 This GIF shows the best recorded run for each model during a 10-minute collection window.
 
-![Best run during 10 minutes](assets/all_models_best_runs.gif)
+![Best run during 10 minutes](assets/all_models_best_10min_grid.gif)
 
 ---
 
