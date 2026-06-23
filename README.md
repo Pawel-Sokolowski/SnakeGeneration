@@ -4,23 +4,35 @@ SnakeGeneration is a reinforcement learning project for training and comparing S
 
 Almost all of the code in this repository was written by me. I used Copilot mainly as support for parts of the project such as the environment vectorization, the viewer/export code, and sections of the `README.md`—especially in areas that were new to me, such as MP4 export.
 
-The project was created mainly as a fun challenge and as an excuse to use a spare GPU I had lying around. All models were trained on a 5 GB GPU.
+The project was created mainly as a fun challenge and as an excuse to make use of a spare GPU I had lying around. All models were trained on a 5 GB GPU.
 
 ---
 
 ## Demo
 
+### Static seed comparison
+
+https://github.com/user-attachments/assets/7ce6f687-500c-41a9-8d47-eb5c8ae909eb
+
+
 ### Single run comparison
 
-This video shows a live-style multi-model comparison in a single run.
+https://github.com/user-attachments/assets/5a9ced84-00ad-4118-a5b4-5b3f104cdf1a
 
-https://github.com/user-attachments/assets/e9494f78-fcd2-4991-b4c2-7f411c7a875b
 
-### Best run during 10 minutes
+### 10 minutes comparison - best score
 
-This video shows the best recorded run for each model during a 10-minute collection window.
+https://github.com/user-attachments/assets/5b0cf737-a5e7-428d-b547-c343cfd68980
 
-https://github.com/user-attachments/assets/c1c7e711-a171-41c2-9301-9f2a0d30da42
+### 1 hour comparison - best score
+
+https://github.com/user-attachments/assets/cb19d2ac-20f8-4fab-992b-16aca5f72090
+
+### Note on variation between runs
+
+Some of the visible differences between models come from simple run-to-run randomness rather than from the model architecture alone. Because the environment uses randomized starts and fruit placement, a model can sometimes look better or worse just because it got a more favorable or less favorable seed in a particular episode.
+
+For that reason, the static-seed comparison is useful as a fairer side-by-side reference point. It does not make every trajectory perfectly identical for the entire run, because different actions still cause the games to diverge, but it reduces a lot of the randomness that appears in fully random comparisons.
 
 ---
 
@@ -210,7 +222,9 @@ Depending on the current version of `app.py`, the viewer can:
 - visualize multiple trained models in a grid,
 - render custom Snake graphics,
 - record a single-run comparison,
-- record a “best run during 10 minutes” comparison.
+- record a “best run during 10 minutes” comparison,
+- record a “best run during 1 hour” comparison,
+- record a static-seed comparison.
 
 ### Benchmarking
 
