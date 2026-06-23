@@ -7,6 +7,7 @@ import pygame
 import torch
 import numpy as np
 import imageio
+from PIL import Image
 
 from env_fast import TorchSnakeEnv
 from models import DuelingMLP, DuelingCNN, DuelingC51CNN
@@ -21,28 +22,40 @@ VIEW_H = 390
 HEADER_H = 72
 FPS = 30
 GRID_SIZE = 20
-MAX_COLS = 4
+
+# Force 5x2 grid for 10 models
+PANEL_COLS = 5
 
 # Layout / spacing
 PANEL_GAP = 16
 OUTER_MARGIN = 16
 BG_COLOR = (8, 8, 10)
 
-# Run collection phase for 10 minutes
+# Green board colors (classic checkerboard)
+BOARD_GREEN_1 = (170, 215, 81)   # lighter green
+BOARD_GREEN_2 = (162, 209, 73)   # darker green
+
+# Panel colors
+PANEL_BG = (34, 52, 28)
+PANEL_BORDER = (70, 95, 55)
+HEADER_BG = (45, 70, 35)
+
+# Best-run collection phase length
 RUN_SECONDS = 10 * 60
 
 # GIF output
 OUTPUT_DIR = "assets"
-GIF_PATH = os.path.join(OUTPUT_DIR, "all_models_best_runs.gif")
+GIF_ALL_DIE_PATH = os.path.join(OUTPUT_DIR, "all_models_until_all_dead.gif")
+GIF_BEST_GRID_PATH = os.path.join(OUTPUT_DIR, "all_models_best_10min_grid.gif")
 
-# Capture every Nth frame while collecting episodes
+# Capture every Nth frame
 CAPTURE_EVERY = 2
 GIF_FPS = max(1, FPS // CAPTURE_EVERY)
 
-# Final GIF max duration (set to None to use full best episodes)
-FINAL_GIF_MAX_SECONDS = 20
+# Optional clipping of final exported GIF
+FINAL_GIF_MAX_SECONDS = None
 
-# Hold last frame of final GIF for 2 seconds
+# Hold last frame for 2 seconds
 FINAL_HOLD_FRAMES = GIF_FPS * 2
 
 SPRITES = {}
@@ -79,8 +92,9 @@ def load_models():
 
 
 MODELS = load_models()
-COLS = max(1, min(MAX_COLS, len(MODELS) if MODELS else 1))
-ROWS = max(1, ((len(MODELS) + COLS - 1) // COLS) if MODELS else 1)
+
+COLS = PANEL_COLS
+ROWS = max(1, (len(MODELS) + COLS - 1) // COLS)
 
 WINDOW_W = OUTER_MARGIN * 2 + COLS * VIEW_W + max(0, COLS - 1) * PANEL_GAP
 WINDOW_H = OUTER_MARGIN * 2 + ROWS * VIEW_H + max(0, ROWS - 1) * PANEL_GAP
@@ -302,7 +316,7 @@ class Viewer:
     def begin_new_episode(self):
         self.dead = False
         self.current_episode_frames = []
-        self.current_episode_score = int(self.env.length[0])
+        self.current_episode_score = max(0, int(self.env.length[0]) - 3)
         self.best_overall = max(self.best_overall, self.current_episode_score)
 
     def restart_episode(self):
@@ -335,7 +349,7 @@ class Viewer:
             self.stack.pop(0)
             self.stack.append(obs.clone())
 
-        score = int(self.env.length[0])
+        score = max(0, int(self.env.length[0]) - 3)
         self.current_episode_score = max(self.current_episode_score, score)
         self.best_overall = max(self.best_overall, score)
 
@@ -374,7 +388,6 @@ class Viewer:
         ys = self.env.snake_y[0].detach().cpu().numpy()
         cap = xs.shape[0]
 
-        # IMPORTANT: your env uses head, head+1, head+2, ...
         idxs = [(head_idx + i) % cap for i in range(length)]
         pts = [(int(xs[i]), int(ys[i])) for i in idxs]
         return pts
@@ -383,26 +396,28 @@ class Viewer:
         panel = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
         rect = panel.get_rect()
 
-        pygame.draw.rect(panel, (18, 18, 18), rect, border_radius=8)
-        pygame.draw.rect(panel, (55, 55, 60), rect, width=1, border_radius=8)
+        # Outer panel background
+        pygame.draw.rect(panel, PANEL_BG, rect, border_radius=8)
+        pygame.draw.rect(panel, PANEL_BORDER, rect, width=1, border_radius=8)
 
+        # Header
         header = pygame.Rect(0, 0, VIEW_W, HEADER_H)
         pygame.draw.rect(
             panel,
-            (35, 35, 35),
+            HEADER_BG,
             header,
             border_top_left_radius=8,
             border_top_right_radius=8
         )
 
-        score = int(self.env.length[0])
+        score = max(0, int(self.env.length[0]) - 3)
 
         title_rect = pygame.Rect(8, 6, VIEW_W - 16, 42)
         draw_wrapped_text(panel, font, self.display_name, (240, 240, 240), title_rect)
 
         badge = "DEAD" if self.dead else "LIVE"
         score_text = f"{badge} | score {score} | best {self.best_overall}"
-        score_img = small_font.render(score_text, True, (255, 210, 120))
+        score_img = small_font.render(score_text, True, (255, 240, 180))
         panel.blit(score_img, (8, HEADER_H - 22))
 
         cell_w = VIEW_W // GRID_SIZE
@@ -410,16 +425,19 @@ class Viewer:
         y0 = HEADER_H
         sprites = get_scaled_sprites(cell_w, cell_h)
 
+        # Green checkerboard board
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
                 r = pygame.Rect(x * cell_w, y0 + y * cell_h, cell_w, cell_h)
-                color = (26, 26, 26) if (x + y) % 2 == 0 else (31, 31, 31)
+                color = BOARD_GREEN_1 if (x + y) % 2 == 0 else BOARD_GREEN_2
                 pygame.draw.rect(panel, color, r)
 
+        # Fruit sprite
         fx = int(self.env.fruit_x[0])
         fy = int(self.env.fruit_y[0])
         panel.blit(sprites["apple"], (fx * cell_w, y0 + fy * cell_h))
 
+        # Snake sprite (blue if your source sprites are blue)
         pts = self.get_snake_points()
         if not pts:
             return panel
@@ -446,7 +464,7 @@ class Viewer:
 
 
 # =========================
-# GRID COMPOSITION
+# GRID / FRAME HELPERS
 # =========================
 def panel_to_rgb_array(panel_surface):
     arr = pygame.surfarray.array3d(panel_surface)
@@ -474,52 +492,270 @@ def compose_grid_frame(panel_frames):
     return frame
 
 
-def export_best_runs_gif(viewers, gif_path):
-    if not viewers:
-        print("No viewers to export.")
+def sanitize_rgb_frame(frame):
+    frame = np.array(frame)
+
+    if np.issubdtype(frame.dtype, np.floating):
+        frame = np.nan_to_num(frame)
+
+    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame[:, :, :3]
+
+    return frame
+
+
+def make_blank_panel():
+    panel = np.zeros((VIEW_H, VIEW_W, 3), dtype=np.uint8)
+    panel[:, :] = np.array(PANEL_BG, dtype=np.uint8)
+
+    # green board area approximation for missing frame fallback
+    cell_w = VIEW_W // GRID_SIZE
+    cell_h = (VIEW_H - HEADER_H) // GRID_SIZE
+
+    for y in range(GRID_SIZE):
+        for x in range(GRID_SIZE):
+            yy0 = HEADER_H + y * cell_h
+            xx0 = x * cell_w
+            color = BOARD_GREEN_1 if (x + y) % 2 == 0 else BOARD_GREEN_2
+            panel[yy0:yy0 + cell_h, xx0:xx0 + cell_w] = np.array(color, dtype=np.uint8)
+
+    return panel
+
+
+def save_gif_from_rgb_frames(frames, gif_path, hold_frames=FINAL_HOLD_FRAMES):
+    if not frames:
+        print(f"No frames to save for: {gif_path}")
         return
 
-    max_len = 0
+    os.makedirs(os.path.dirname(gif_path), exist_ok=True)
+
+    writer = imageio.get_writer(
+        gif_path,
+        mode="I",
+        fps=GIF_FPS,
+        palettesize=256,
+        quantizer="nq"
+    )
+
+    for frame in frames:
+        frame = sanitize_rgb_frame(frame)
+        img = Image.fromarray(frame, "RGB").convert(
+            "P",
+            palette=Image.ADAPTIVE,
+            colors=256
+        )
+        writer.append_data(np.array(img))
+
+    last_frame = sanitize_rgb_frame(frames[-1])
+    last_img = Image.fromarray(last_frame, "RGB").convert(
+        "P",
+        palette=Image.ADAPTIVE,
+        colors=256
+    )
+    last_arr = np.array(last_img)
+
+    for _ in range(hold_frames):
+        writer.append_data(last_arr)
+
+    writer.close()
+    print(f"Saved GIF: {gif_path}")
+
+
+def build_best_grid_frames(viewers):
+    per_viewer_frames = []
+
     for v in viewers:
-        if len(v.best_episode_frames) > max_len:
-            max_len = len(v.best_episode_frames)
+        frames = v.best_episode_frames if v.best_episode_frames else v.current_episode_frames
 
-    if max_len == 0:
-        print("No best episode frames recorded; nothing to save.")
-        return
+        print(f"{v.display_name}: best_frames={len(frames)} score={v.best_episode_score}")
 
-    if FINAL_GIF_MAX_SECONDS is not None:
-        max_export_frames = FINAL_GIF_MAX_SECONDS * GIF_FPS
-        max_len = min(max_len, max_export_frames)
+        if not frames:
+            frames = [make_blank_panel()]
 
-    writer = imageio.get_writer(gif_path, mode="I", fps=GIF_FPS)
-    try:
-        last_full_frame = None
+        if FINAL_GIF_MAX_SECONDS is not None:
+            max_frames = int(FINAL_GIF_MAX_SECONDS * GIF_FPS)
+            frames = frames[:max_frames]
 
-        for t in range(max_len):
-            panel_frames = []
-            for v in viewers:
-                if len(v.best_episode_frames) == 0:
-                    blank = np.zeros((VIEW_H, VIEW_W, 3), dtype=np.uint8)
-                    blank[:, :] = np.array((20, 20, 20), dtype=np.uint8)
-                    panel_frames.append(blank)
-                    continue
+        cleaned = [sanitize_rgb_frame(f) for f in frames]
+        per_viewer_frames.append(cleaned)
 
-                if t < len(v.best_episode_frames):
-                    panel_frames.append(v.best_episode_frames[t])
-                else:
-                    panel_frames.append(v.best_episode_frames[-1])
+    if not per_viewer_frames:
+        return []
 
-            full_frame = compose_grid_frame(panel_frames)
-            writer.append_data(full_frame)
-            last_full_frame = full_frame
+    max_len = max(len(frames) for frames in per_viewer_frames)
+    grid_frames = []
 
-        if last_full_frame is not None:
-            for _ in range(FINAL_HOLD_FRAMES):
-                writer.append_data(last_full_frame)
+    for t in range(max_len):
+        panel_frames = []
+        for frames in per_viewer_frames:
+            panel = frames[t] if t < len(frames) else frames[-1]
+            panel_frames.append(panel)
 
-    finally:
-        writer.close()
+        grid = compose_grid_frame(panel_frames)
+        grid_frames.append(grid)
+
+    return grid_frames
+
+
+# =========================
+# RENDER / PHASE HELPERS
+# =========================
+def render_viewers(screen, viewers, font, small_font, status_text):
+    screen.fill(BG_COLOR)
+
+    panel_surfaces = []
+    for i, v in enumerate(viewers):
+        panel = v.render_to_surface(font, small_font)
+        panel_surfaces.append(panel)
+
+        col = i % COLS
+        row = i // COLS
+        x = OUTER_MARGIN + col * (VIEW_W + PANEL_GAP)
+        y = OUTER_MARGIN + row * (VIEW_H + PANEL_GAP)
+
+        screen.blit(panel, (x, y))
+
+    info_img = small_font.render(status_text, True, (190, 190, 200))
+    screen.blit(info_img, (OUTER_MARGIN, 4))
+
+    pygame.display.flip()
+
+    return panel_surfaces
+
+
+def collect_grid_until_all_dead(screen, viewers, font, small_font, clock):
+    """
+    Phase 1:
+    - start all models once
+    - never restart
+    - record the 5x2 grid until all models are dead
+    """
+    grid_frames = []
+    frame_count = 0
+    running = True
+
+    while running:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return grid_frames, False
+
+        for v in viewers:
+            v.step()
+
+        panel_surfaces = render_viewers(
+            screen,
+            viewers,
+            font,
+            small_font,
+            "Phase 1/2: recording until all models die..."
+        )
+
+        clock.tick(FPS)
+
+        if frame_count % CAPTURE_EVERY == 0:
+            panel_frames = [panel_to_rgb_array(panel) for panel in panel_surfaces]
+            grid = compose_grid_frame(panel_frames)
+            grid_frames.append(grid)
+
+        frame_count += 1
+
+        if all(v.dead for v in viewers):
+            running = False
+
+    return grid_frames, True
+
+
+def collect_best_runs_for_duration(screen, viewers, font, small_font, clock, run_seconds):
+    """
+    Phase 2:
+    - run for N seconds
+    - restart models during timed collection
+    - once time expires:
+        * stop restarting
+        * allow currently running episodes to finish
+        * still let those last episodes compete to become the best
+    """
+    start_time = time.monotonic()
+    frame_count = 0
+
+    timed_phase = True
+    running = True
+
+    while running:
+        now = time.monotonic()
+        elapsed = now - start_time
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return False
+
+        if timed_phase and elapsed >= run_seconds:
+            timed_phase = False
+            print("Time limit reached. Waiting for currently running episodes to finish...")
+
+        dead_this_frame = []
+        for v in viewers:
+            just_died = v.step()
+            dead_this_frame.append(just_died)
+
+        if timed_phase:
+            remaining = max(0, int(run_seconds - elapsed))
+            mins = remaining // 60
+            secs = remaining % 60
+            status_text = f"Phase 2/2: collecting best episodes... {mins:02d}:{secs:02d} remaining"
+        else:
+            alive_count = sum(not v.dead for v in viewers)
+            status_text = f"Phase 2/2: finishing active episodes... alive: {alive_count}"
+
+        panel_surfaces = render_viewers(
+            screen,
+            viewers,
+            font,
+            small_font,
+            status_text
+        )
+
+        clock.tick(FPS)
+
+        if frame_count % CAPTURE_EVERY == 0:
+            if timed_phase:
+                # During timed phase, capture every model every time
+                for v, panel in zip(viewers, panel_surfaces):
+                    rgb = panel_to_rgb_array(panel)
+                    v.capture_panel_frame(rgb)
+            else:
+                # After timeout, only capture models that are still alive
+                # or models that died exactly on this frame (to include final frame)
+                for v, panel, just_died in zip(viewers, panel_surfaces, dead_this_frame):
+                    if (not v.dead) or just_died:
+                        rgb = panel_to_rgb_array(panel)
+                        v.capture_panel_frame(rgb)
+
+        frame_count += 1
+
+        if timed_phase:
+            # Normal timed collection: replace best and restart immediately
+            for v, just_died in zip(viewers, dead_this_frame):
+                if just_died:
+                    v.maybe_replace_best_episode()
+                    v.restart_episode()
+        else:
+            # Graceful finish: replace best but DO NOT restart
+            for v, just_died in zip(viewers, dead_this_frame):
+                if just_died:
+                    v.maybe_replace_best_episode()
+
+            # Exit only when everybody has finished the last active run
+            if all(v.dead for v in viewers):
+                running = False
+
+    # final safety pass
+    for v in viewers:
+        v.maybe_replace_best_episode()
+
+    return True
 
 
 # =========================
@@ -527,7 +763,7 @@ def export_best_runs_gif(viewers, gif_path):
 # =========================
 def main():
     pygame.init()
-    pygame.display.set_caption("Snake Best-Run Collector")
+    pygame.display.set_caption("Snake GIF Collector (5x2 Grid, Green Board)")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -556,74 +792,42 @@ def main():
         pygame.quit()
         return
 
-    viewers = [Viewer(m) for m in MODELS]
+    print(f"Loaded {len(MODELS)} models.")
+    print(f"Grid layout: {COLS}x{ROWS}")
 
-    start_time = time.monotonic()
-    frame_count = 0
-    running = True
+    # -------------------------
+    # PHASE 1: run until all die
+    # -------------------------
+    viewers_phase1 = [Viewer(m) for m in MODELS]
+    phase1_frames, continue_after_phase1 = collect_grid_until_all_dead(
+        screen, viewers_phase1, font, small_font, clock
+    )
+    save_gif_from_rgb_frames(phase1_frames, GIF_ALL_DIE_PATH)
 
-    while running:
-        now = time.monotonic()
-        if now - start_time >= RUN_SECONDS:
-            running = False
+    if not continue_after_phase1:
+        print("Window closed during phase 1.")
+        pygame.quit()
+        return
 
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                running = False
+    # -------------------------
+    # PHASE 2: 10 minutes + graceful finish
+    # -------------------------
+    viewers_phase2 = [Viewer(m) for m in MODELS]
+    completed_phase2 = collect_best_runs_for_duration(
+        screen, viewers_phase2, font, small_font, clock, RUN_SECONDS
+    )
 
-        dead_this_frame = []
-        for v in viewers:
-            just_died = v.step()
-            dead_this_frame.append(just_died)
+    best_grid_frames = build_best_grid_frames(viewers_phase2)
+    save_gif_from_rgb_frames(best_grid_frames, GIF_BEST_GRID_PATH)
 
-        screen.fill(BG_COLOR)
+    print("\nBest episode scores:")
+    for v in viewers_phase2:
+        print(f"{v.display_name}: {v.best_episode_score}")
 
-        panel_surfaces = []
-        for i, v in enumerate(viewers):
-            panel = v.render_to_surface(font, small_font)
-            panel_surfaces.append(panel)
-
-            col = i % COLS
-            row = i // COLS
-            x = OUTER_MARGIN + col * (VIEW_W + PANEL_GAP)
-            y = OUTER_MARGIN + row * (VIEW_H + PANEL_GAP)
-
-            screen.blit(panel, (x, y))
-
-        elapsed = now - start_time
-        remaining = max(0, int(RUN_SECONDS - elapsed))
-        mins = remaining // 60
-        secs = remaining % 60
-        progress_text = f"Collecting best runs... {mins:02d}:{secs:02d} remaining"
-        prog_img = small_font.render(progress_text, True, (190, 190, 200))
-        screen.blit(prog_img, (OUTER_MARGIN, 4))
-
-        pygame.display.flip()
-        clock.tick(FPS)
-
-        if frame_count % CAPTURE_EVERY == 0:
-            for v, panel in zip(viewers, panel_surfaces):
-                rgb = panel_to_rgb_array(panel)
-                v.capture_panel_frame(rgb)
-
-        frame_count += 1
-
-        for v, just_died in zip(viewers, dead_this_frame):
-            if just_died:
-                v.maybe_replace_best_episode()
-                v.restart_episode()
-
-    for v in viewers:
-        v.maybe_replace_best_episode()
+    if not completed_phase2:
+        print("Window closed during phase 2.")
 
     pygame.quit()
-
-    export_best_runs_gif(viewers, GIF_PATH)
-    print("Saved GIF:", GIF_PATH)
-
-    print("\\nBest episode scores:")
-    for v in viewers:
-        print(f"{v.display_name}: {v.best_episode_score}")
 
 
 if __name__ == "__main__":
