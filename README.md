@@ -276,4 +276,4 @@ Contributions are welcome. If you want to improve training, visualization, model
 
 ## License
 
-This repository currently does not declare a license in the project structure shown here. If you plan to make the project open source for broader reuse, adding a `LICENSE` file is strongly recommended.
+This repository is under GNU General Public License v3.0
